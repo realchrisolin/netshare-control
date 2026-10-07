@@ -18,5 +18,9 @@
 # Use a numeric uid. Do not put a name or a host-specific id in this example.
 # NETSHARE_UID=""
 
+# System user the first `up` creates if this name does not exist.
+# `down` does not remove it. The shell is nologin, and no home directory is created.
+# RUN_USER="netshare"
+
 # Concurrent tun2proxy sessions. The binary's own default is 200.
 # MAX_SESSIONS="1024"

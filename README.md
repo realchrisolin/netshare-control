@@ -83,6 +83,10 @@ example and keep the real file out of git:
 sudo install -m 0644 -o root -g root netshare.conf.example /etc/netshare.conf
 ```
 
+The first `up` creates a system user named `netshare` if that account does
+not exist. How to use says what the account is for. `down` does not remove
+it. Set `RUN_USER` in the conf before that first `up` to use another name.
+
 The Omarchy bar is optional. The shell loads `netshare.js` from beside the
 QML file, so symlink both. Add this widget to the bar layout in
 `~/.config/omarchy/shell.json`:
@@ -118,6 +122,16 @@ the tun, installs its routes and firewall rules, and points the resolver at
 it. sudo is how an account reaches that root, and the account that ran sudo
 is the one whose traffic then uses the tun. `status` and `bar` only read
 state.
+
+The first `up` also creates a system user when `RUN_USER` does not already
+exist. The default name is `netshare`. Creation is `useradd --system`: a
+`nologin` shell, a locked password, its own group, and no home directory.
+The passwd entry may still name a home path. That directory is not created.
+`down` leaves the account in place. This user is separate from the account
+whose traffic follows the tun. `netshare run`, and the check `up` runs
+before it moves a desktop account, drop to this user so those commands use
+the tun. tun2proxy keeps running as root. Set `RUN_USER` in the root-owned
+conf before the first `up` to choose another name.
 
 A cached sudo ticket is reused. From a terminal, sudo asks on that terminal.
 With no terminal, sudo opens a desktop password dialog (`pinentry-qt`, or
@@ -186,7 +200,7 @@ These names are the working defaults. The same conf file can override them. `up`
 | `ROUTE_PROBE` | `9.9.9.9` | IPv4 address other than either DNS server | Address used to ask which device a normal lookup uses. The DNS servers already have host routes into the tun. |
 | `NETSHARE_PREFIX` | `192.168.49.` | IPv4 prefix text | Client addresses must start with this. The tun address is `10.10.` plus the last two octets. |
 | `NETSHARE_GATEWAY` | `192.168.49.1` | IPv4 address | Proxy gateway. It is not mapped to a tun address. |
-| `RUN_USER` | `netshare` | user name | System user for `netshare run`. Created if missing. |
+| `RUN_USER` | `netshare` | user name | System user the first `up` creates when that name is missing. `nologin` shell, locked password, no home directory. `down` does not delete it. |
 | `BAR_ICON` | U+F0EC | one character | Glyph drawn in the bar. |
 
 Runtime files are not settings. State and session bookkeeping live under `/run/netshare`. The tun2proxy log is `/var/log/netshare/tun2proxy.log`. `netshare run` bind-mounts resolver files from `/etc/netshare`. The proxy file for programs that ignore the routing table is `/etc/sysconfig/proxy`.
@@ -206,8 +220,9 @@ considers every connected link.
 ## Routing
 
 The selected account's packets use a uid rule into a side table before the
-kernel picks a source address. A mark set in a later netfilter hook is not
-enough for that. The main-table default stays in place. There are no `/1`
+kernel picks a source address. `RUN_USER` has a separate uid rule, used by
+`netshare run` and by the check `up` makes before that account is moved. A
+mark set in a later netfilter hook is not enough for that. The main-table default stays in place. There are no `/1`
 routes. systemd-resolved is not pointed at `198.18.0.1`. TCP and UDP go
 through the SOCKS5 proxy. ICMP does not.
 
