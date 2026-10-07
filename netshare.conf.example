@@ -11,3 +11,8 @@
 # Only `netshare bar` uses this. Empty lists every link the probe accepted.
 # A non-empty value is a NetworkManager connection-name prefix.
 # CONNECTION_PREFIX=""
+
+# Account whose traffic `up` and `default on` send through the tun.
+# Overrides sudo. Empty, and no sudo user, leaves the tun for `netshare run`.
+# Use a numeric uid. Do not put a name or a host-specific id in this example.
+# NETSHARE_UID=""

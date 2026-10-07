@@ -4,13 +4,15 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "netshare.js" as Panel
 
 // Bar icon and panel for the netshare controller. The panel follows the
 // network panel: a hero with the switch on the right, then the adapter
 // list. Left click opens it. The switch runs `netshare up` or `netshare down`
-// to match the position it is showing, so a stale off position cannot stop
-// a tunnel the controller still has up. Names and addresses come from the
-// live lookup.
+// with NETSHARE_PROMPT=desktop, so a missing sudo ticket opens a desktop
+// password dialog. The command matches the position the switch is showing,
+// so a stale off position cannot stop a tunnel the controller still has up.
+// Names and addresses come from the live lookup.
 Item {
   id: root
 
@@ -47,71 +49,33 @@ Item {
   readonly property color barGlyph: bar ? bar.barForeground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property var orderedLinks: {
-    var yes = []
-    var rest = []
-    var list = root.links || []
-    for (var i = 0; i < list.length; i++) {
-      var link = list[i]
-      if (!link) continue
-      if (link.answer === "yes") yes.push(link)
-      else rest.push(link)
-    }
-    return yes.concat(rest)
-  }
+  readonly property var orderedLinks: Panel.orderedLinks(links)
 
-  readonly property int accessPointCount: {
-    var count = 0
-    var list = orderedLinks
-    for (var i = 0; i < list.length; i++)
-      if (list[i] && list[i].answer === "yes") count++
-    return count
-  }
+  readonly property int accessPointCount: Panel.accessPointCount(links)
 
-  readonly property var accessPoint: accessPointCount === 1 ? orderedLinks[0] : null
+  readonly property var accessPoint: Panel.accessPoint(links)
 
-  readonly property var focusLink: {
-    var list = orderedLinks
-    if (boundDevice !== "") {
-      for (var i = 0; i < list.length; i++) {
-        if (list[i] && String(list[i].device) === boundDevice) return list[i]
-      }
-      // A different link is not the one the tunnel bound.
-      if (tunnelUp || tunnelLabel === "stale") return null
-    }
-    if (accessPoint) return accessPoint
-    if (list.length === 1) return list[0]
-    return null
-  }
+  readonly property var focusLink: Panel.focusLink({
+    links: links,
+    boundDevice: boundDevice,
+    tunnelUp: tunnelUp,
+    tunnelLabel: tunnelLabel
+  })
 
   readonly property string heroTitle: {
     if (focusLink && focusLink.connection) return String(focusLink.connection)
     return "NetShare"
   }
 
-  function proxyText(link) {
-    if (!link) return ""
-    var proxy = String(link.proxy || "")
-    proxy = proxy.replace(/^https?:\/\//, "")
-    return proxy.split("/")[0]
-  }
+  readonly property string shownProxy: Panel.shownProxy(focusLink, boundProxy)
 
-  readonly property string shownProxy: {
-    var fromLink = proxyText(focusLink)
-    if (fromLink !== "") return fromLink
-    var saved = String(boundProxy || "")
-    saved = saved.replace(/^https?:\/\//, "")
-    return saved.split("/")[0]
-  }
-
-  readonly property string metaText: {
-    if (toggleBusy) return pendingUp ? "Starting" : "Stopping"
-    if (tunnelLabel === "stale") return "Stale"
-    if (tunnelUp && posture === "desktop") return "Desktop"
-    if (tunnelUp && posture === "side") return "Side"
-    if (tunnelUp) return "On"
-    return "Off"
-  }
+  readonly property string metaText: Panel.metaText({
+    toggleBusy: toggleBusy,
+    pendingUp: pendingUp,
+    tunnelLabel: tunnelLabel,
+    tunnelUp: tunnelUp,
+    posture: posture
+  })
 
   readonly property string tunnelValue: {
     if (tunnelLabel === "stale") return "Stale"
@@ -212,7 +176,7 @@ Item {
     root.toggleError = ""
     root.toggleStderr = ""
     root.pendingUp = !root.tunnelUp
-    toggleProc.command = ["bash", "-lc", root.pendingUp ? "netshare up" : "netshare down"]
+    toggleProc.command = ["bash", "-lc", root.pendingUp ? "NETSHARE_PROMPT=desktop netshare up" : "NETSHARE_PROMPT=desktop netshare down"]
     toggleProc.running = true
   }
 
@@ -247,7 +211,7 @@ Item {
 
   Process {
     id: toggleProc
-    command: ["bash", "-lc", "netshare toggle"]
+    command: ["bash", "-lc", "NETSHARE_PROMPT=desktop netshare toggle"]
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.toggleStderr = text
