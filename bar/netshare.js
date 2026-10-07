@@ -59,6 +59,15 @@ function shownProxy(focus, boundProxy) {
   return saved.split("/")[0]
 }
 
+function dataPlaneText(boundProxy, tunnelUp) {
+  if (!tunnelUp) return ""
+  var saved = String(boundProxy || "")
+  saved = saved.replace(/^(https?|socks5):\/\//, "")
+  saved = saved.split("/")[0].split("?")[0]
+  if (saved === "") return ""
+  return "SOCKS5 " + saved
+}
+
 function metaText(state) {
   if (state.toggleBusy) return state.pendingUp ? "Starting" : "Stopping"
   if (state.tunnelLabel === "stale") return "Stale"
@@ -76,6 +85,7 @@ if (typeof module !== "undefined" && module.exports) {
     focusLink: focusLink,
     proxyText: proxyText,
     shownProxy: shownProxy,
+    dataPlaneText: dataPlaneText,
     metaText: metaText
   }
 }

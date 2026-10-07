@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Console controller for a NetShare HTTP-proxy tun.
-# `netshare bar` is the optional panel readout and does not change routes.
+# Console controller for a NetShare tun. Discovery uses the HTTP proxy.
+# tun2proxy uses SOCKS5 on that same port. `netshare bar` is the optional
+# panel readout and does not change routes.
 
 set -euo pipefail
 HERE=$(dirname "$(readlink -f "$0")")

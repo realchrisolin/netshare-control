@@ -1,12 +1,15 @@
 # netshare
 
-Console controller for a NetShare HTTP-proxy tun. An Omarchy bar panel is
-optional and is not required to bring the tunnel up.
+Console controller for a NetShare tun. An Omarchy bar panel is optional
+and is not required to bring the tunnel up.
 
 NetShare tells clients to use an HTTP proxy on the access point's gateway.
-This tree owns routes, policy routing, and DNS. [tun2proxy](https://github.com/tun2proxy/tun2proxy)
-is the data plane. It is installed separately and is never started with
-`--setup`. Checksums for the 0.8.4 static binary are in `TUN2PROXY.txt`.
+That port also accepts SOCKS5. This tree owns routes, policy routing, and
+DNS. Discovery and the session proxy stay on the HTTP URL.
+[tun2proxy](https://github.com/tun2proxy/tun2proxy) is the data plane: it is
+started with SOCKS5 on that same host and port, which carries UDP. It is
+installed separately and is never started with `--setup`. Checksums for the
+0.8.4 static binary are in `TUN2PROXY.txt`.
 
 The address mapping is the one that app builds: a client address in
 `192.168.49.0/24` becomes `10.10.` plus those last two octets, as a `/32`,
@@ -100,7 +103,8 @@ the rest of the user config, so leave that command alone.
 ## How to use
 
 Connect to the NetShare access point with NetworkManager. `up` then uses a
-connected link whose gateway answers as an HTTP proxy on port 8282.
+connected link whose gateway answers as an HTTP proxy on port 8282, and
+sends the tun through SOCKS5 on that same host and port.
 
 ```bash
 sudo netshare up
@@ -151,7 +155,7 @@ discover.
 | Name | Default | Expected | What it does |
 | --- | --- | --- | --- |
 | `PROXY_PORT` | `8282` | TCP port | Port used to build `http://<gateway>:<port>` when `PROXY_URL` is empty. |
-| `PROXY_URL` | empty | `http://host:port` with no user or password, or empty | Pins the proxy. A set value also ignores gateways that are a different host. |
+| `PROXY_URL` | empty | `http://host:port` with no user or password, or empty | Pins the HTTP proxy used for discovery and for programs that ignore the routing table. The tun uses SOCKS5 on that same host and port. A set value also ignores gateways that are a different host. |
 | `BYPASS_CIDR` | empty | IPv4 CIDR, or empty | On-link prefix that stays off the tun. A set value keeps only a link whose on-link route is that CIDR. |
 | `IFACE` | empty | NetworkManager device name, or empty | Limits the probe to one device. Required when two proxies answer. |
 | `CONNECTION_PREFIX` | empty | start of a connection name, or empty | Used only by `bar`. Empty lists every link the probe accepted. |
@@ -174,6 +178,7 @@ These names are the working defaults. The same conf file can override them. `up`
 | `RUNNER_RULE_PREF` | `5010` | integer between `RULE_PREF` and `5210` | Priority of the `RUN_USER` uid rule. |
 | `DESKTOP_RULE_PREF` | `5300` | integer after `5270` and before `32766` | Priority of the selected account's uid rule. |
 | `TUN_MTU` | `10000` | MTU | Tun MTU. |
+| `MAX_SESSIONS` | `1024` | positive integer | Concurrent tun2proxy sessions. The binary's own default is 200. Past the cap, `--exit-on-fatal-error` quits the process and the reap job removes the tun. |
 | `VIRTUAL_CIDR` | `198.18.0.0/15` | IPv4 CIDR | tun2proxy's virtual address pool. It is not a resolver. |
 | `DNS_SERVER_1` | `1.1.1.1` | IPv4 address | First resolver given to the tun. Cloudflare's primary public resolver. |
 | `DNS_SERVER_2` | `1.0.0.1` | IPv4 address | Second resolver given to the tun. Cloudflare's secondary public resolver. |
@@ -189,8 +194,9 @@ Runtime files are not settings. State and session bookkeeping live under `/run/n
 ## Access point
 
 A connected Wi-Fi or Ethernet link qualifies when its gateway answers as an
-HTTP proxy on the configured port. The SSID is not a selection key. Two
-answering links need `IFACE` in `/etc/netshare.conf`.
+HTTP proxy on the configured port. The tun then uses SOCKS5 on that host
+and port. The SSID is not a selection key. Two answering links need `IFACE`
+in `/etc/netshare.conf`.
 
 `CONNECTION_PREFIX` is optional and applies only to `netshare bar`. Empty
 lists every link the probe accepted. A non-empty value is a NetworkManager
@@ -202,8 +208,8 @@ considers every connected link.
 The selected account's packets use a uid rule into a side table before the
 kernel picks a source address. A mark set in a later netfilter hook is not
 enough for that. The main-table default stays in place. There are no `/1`
-routes. systemd-resolved is not pointed at `198.18.0.1`. ICMP, QUIC, and
-arbitrary UDP are out of scope.
+routes. systemd-resolved is not pointed at `198.18.0.1`. TCP and UDP go
+through the SOCKS5 proxy. ICMP does not.
 
 The tun's resolvers are `DNS_SERVER_1` and `DNS_SERVER_2`, Cloudflare's
 `1.1.1.1` and `1.0.0.1`, with opportunistic DNS-over-TLS. `up` installs a
@@ -212,8 +218,8 @@ host route for each into the tun before it installs the account rule.
 different public address, used only to see which device a normal lookup
 uses, because the resolver addresses already point at the tun.
 
-When an account is selected, `up` also publishes the access-point proxy for
-programs that ignore the routing table. That is `/etc/sysconfig/proxy`, the
+When an account is selected, `up` also publishes the access-point HTTP proxy
+for programs that ignore the routing table. That is `/etc/sysconfig/proxy`, the
 account's user environment when a session bus exists, and gsettings when
 `gsettings` is installed. A host without those still gets the tun.
 
@@ -227,7 +233,8 @@ The hero names the focused connection. The status line is Desktop or Side
 while the tunnel is up (`desktop` and `side` are the posture values), and
 Off, Stale, Starting, or Stopping otherwise. The rows are connection,
 adapter, address, proxy host:port, and the tun address. While the tunnel is
-up or the saved state is stale, those rows stay on the bound adapter.
+up, a data-plane row shows SOCKS5 on the bound proxy. While the tunnel is
+up or the saved state is stale, the other rows stay on the bound adapter.
 
 The module polls `netshare bar`. Saving the QML does not reload a running
 shell.

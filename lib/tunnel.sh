@@ -2,14 +2,17 @@
 # netshare: give this host internet through a NetShare access point.
 #
 # The SSID is not an identity. NetShare (kha.prog.mikrotik) tells clients to
-# use an HTTP proxy on the access point's DHCP gateway, port 8282. Any
-# connected Wi-Fi or Ethernet link whose gateway answers there is eligible.
-# The on-link subnet of that interface is the bypass, so the proxy session
-# cannot loop into the tun.
+# use an HTTP proxy on the access point's DHCP gateway, port 8282. That same
+# port accepts unauthenticated SOCKS5. Any connected Wi-Fi or Ethernet link
+# whose gateway answers the HTTP proxy is eligible. The on-link subnet of
+# that interface is the bypass, so the proxy session cannot loop into the tun.
 #
-# tun2proxy is the data plane. This script owns routes, the fwmark, and DNS.
-# It never passes --setup: that flag assigns 10.0.0.33/24 and installs routes
-# itself. The tun address is the one kha.prog.mikrotik.vpn builds. setAddress
+# tun2proxy is the data plane and is started with socks5:// on that host and
+# port. SOCKS5 UDP associate carries datagrams. HTTP CONNECT cannot.
+# Discovery, the bar, and the session proxy keep the HTTP URL. This script
+# owns routes, the fwmark, and DNS. It never passes --setup: that flag assigns
+# 10.0.0.33/24 and installs routes itself. The tun address is the one
+# kha.prog.mikrotik.vpn builds. setAddress
 # keeps the local address that starts with 192.168.49. and stores the literal
 # 192.168.49.1 as the gateway. startVPN splits that local address and
 # concatenates 10.10. with the last two octets. Builder.addAddress installs
@@ -32,13 +35,14 @@
 # public address, up removes what it added and leaves the built-in resolver
 # in place.
 #
-# The watch Wi-Fi network uses a static HTTP proxy, 192.168.49.1 port 8282,
-# with an empty exclusion list. tun2proxy uses that same proxy. While the
-# desktop rule is installed, the session proxy is set to the same host and
-# port. libproxy on Hyprland does not read the GNOME proxy settings, so the
-# same values are also written to /etc/sysconfig/proxy and to the desktop
-# user's activation environment. Localhost and the other on-link LANs stay
-# direct; the watch has no second network to protect.
+# The watch client uses SOCKS on 192.168.49.1 port 8282, which is why UDP
+# works there. tun2proxy uses that same SOCKS5 endpoint. While the desktop
+# rule is installed, the session proxy stays the HTTP URL on that host and
+# port, for programs that ignore the routing table. libproxy on Hyprland
+# does not read the GNOME proxy settings, so the same values are also written
+# to /etc/sysconfig/proxy and to the desktop user's activation environment.
+# Localhost and the other on-link LANs stay direct; the watch has no second
+# network to protect.
 #
 # Tailscale installs "from all lookup 52" at priority 5270. The fwmark rule
 # and the netshare user's uid rule are pinned below 5210. nft sets the mark
@@ -78,6 +82,9 @@ RUNNER_RULE_PREF="5010"
 # After Tailscale's lookup-52 rule at 5270, and before main at 32766.
 DESKTOP_RULE_PREF="5300"
 TUN_MTU="10000"
+# tun2proxy's built-in cap is 200. A burst of hung TCP holds a slot until
+# its 600s timeout, and --exit-on-fatal-error then quits the process.
+MAX_SESSIONS="1024"
 VIRTUAL_CIDR="198.18.0.0/15"
 # Cloudflare public resolvers. RUN_DNS is what `netshare run` queries over TCP.
 DNS_SERVER_1="1.1.1.1"
@@ -491,10 +498,42 @@ check_policy() {
   if (( DESKTOP_RULE_PREF <= 5270 || DESKTOP_RULE_PREF >= 32766 )); then
     die "desktop rule priority ${DESKTOP_RULE_PREF} must follow Tailscale priority 5270"
   fi
+  [[ "$MAX_SESSIONS" =~ ^[1-9][0-9]*$ ]] || die "MAX_SESSIONS must be a positive integer"
   if [[ -n "$PROXY_URL" ]]; then
+    # Discovery, the bar, and the session proxy use this HTTP URL.
+    # tun2proxy receives the SOCKS5 form of the same host and port.
     [[ "$PROXY_URL" == http://* ]] || die "PROXY_URL must start with http://"
     [[ "$PROXY_URL" != *@* ]] || die "PROXY_URL must not carry credentials"
   fi
+}
+
+# SOCKS5 URL for tun2proxy. PROXY_URL itself stays http://host:port.
+# Prints the URL on stdout. On rejection, prints the reason on stderr and
+# returns 1 so a caller in the middle of setup can tear down.
+data_plane_proxy() {
+  local url=$1 rest hostport
+  if [[ -z "$url" ]]; then
+    echo "netshare: PROXY_URL is empty" >&2
+    return 1
+  fi
+  if [[ "$url" == *@* ]]; then
+    echo "netshare: PROXY_URL must not carry credentials" >&2
+    return 1
+  fi
+  case "$url" in
+    http://*|socks5://*) ;;
+    *)
+      echo "netshare: PROXY_URL must start with http://" >&2
+      return 1
+      ;;
+  esac
+  rest=${url#*://}
+  hostport=${rest%%[/?#]*}
+  if [[ "$hostport" != *:* || "$hostport" == :* || "$hostport" == *: ]]; then
+    echo "netshare: PROXY_URL must include a host and port" >&2
+    return 1
+  fi
+  printf 'socks5://%s\n' "$hostport"
 }
 
 check_config() {
@@ -1253,7 +1292,7 @@ probe_marked_http() {
 # Gate 2. Host routes only. The desktop uid rule is not installed yet,
 # so ROUTE_PROBE must still follow the main-table default.
 verify_dns_gate() {
-  local out="" via="" ip_re dns1_re dns2_re
+  local out="" via="" ip_re dns1_re dns2_re url="" plane=""
   resolvectl reset-server-features >/dev/null 2>&1 || true
   resolvectl flush-caches >/dev/null 2>&1 || true
   if ! out=$(timeout 20 resolvectl query -4 example.com 2>&1); then
@@ -1285,8 +1324,14 @@ verify_dns_gate() {
     printf '%s\n' "$via" >&2
     return 1
   fi
-  if ! grep -F "Proxy http server: ${gateway}:${PROXY_PORT}" "$LOG" >/dev/null 2>&1; then
-    echo "netshare: tun log does not show proxy ${gateway}:${PROXY_PORT}" >&2
+  url=${PROXY_URL:-}
+  [[ -n "$url" ]] || url=${state_proxy:-}
+  if ! plane=$(data_plane_proxy "$url"); then
+    return 1
+  fi
+  # tun2proxy 0.8.4 logs "Proxy socks5 server: <host>:<port>".
+  if ! grep -F "Proxy socks5 server: ${plane#socks5://}" "$LOG" >/dev/null 2>&1; then
+    echo "netshare: tun log does not show proxy ${plane#socks5://}" >&2
     return 1
   fi
   ip_re=${tun_ip//./\\.}
@@ -1413,7 +1458,7 @@ sys.exit(1)
 }
 
 cmd_status() {
-  local engine rule nft_state half bound_iface="" bound_src="" bound_proxy="" bound_ssid=""
+  local engine rule nft_state half bound_iface="" bound_src="" bound_proxy="" bound_ssid="" plane=""
   if [[ -x "$TUN2PROXY" ]]; then
     engine=$("$TUN2PROXY" --version 2>/dev/null || echo "unknown")
   else
@@ -1432,6 +1477,12 @@ cmd_status() {
     else
       echo "tunnel: stale (state present, process or ${TUN} is missing)"
       echo "posture: ${posture:-unknown}"
+    fi
+    if [[ -n "$bound_proxy" ]]; then
+      plane=$(data_plane_proxy "$bound_proxy" 2>/dev/null || true)
+      if [[ -n "$plane" ]]; then
+        echo "data-plane: ${plane}"
+      fi
     fi
   else
     echo "tunnel: down"
@@ -1534,7 +1585,7 @@ resolve_traffic_uid() {
 }
 
 report_up() {
-  local main_default detail
+  local main_default detail plane=""
   main_default=$(ip -4 route show default | head -n 1)
   if [[ "$posture" == "desktop" ]]; then
     detail="dns: ${DNS_SERVER_1} ${DNS_SERVER_2} opportunistic"
@@ -1548,6 +1599,10 @@ report_up() {
   echo "  access point: ${ssid:-unnamed} on ${iface} ${src}"
   echo "  tun: ${TUN} ${tun_addr}"
   echo "  proxy: ${PROXY_URL}"
+  plane=$(data_plane_proxy "$PROXY_URL") || plane=""
+  if [[ -n "$plane" ]]; then
+    echo "  data plane: ${plane}"
+  fi
   printf '  %s\n' "$detail"
 }
 
@@ -1565,7 +1620,7 @@ cmd_up() {
     echo "netshare: cleaning a stale tunnel" >&2
     teardown
   fi
-  local traffic_uid=0
+  local traffic_uid=0 plane=""
   if resolve_traffic_uid; then
     traffic_uid=1
   fi
@@ -1598,6 +1653,7 @@ cmd_up() {
   if [[ "$tun_ip" != 10.10.49.* || "$tun_ip" == "10.10.49.1" || "$tun_ip" == "10.0.0.33" ]]; then
     die "refusing tun address ${tun_ip}"
   fi
+  plane=$(data_plane_proxy "$PROXY_URL") || exit 1
   ensure_user
   ensure_etc
   ensure_dispatcher
@@ -1608,7 +1664,7 @@ cmd_up() {
   trap on_up_err ERR
   trap on_up_signal INT TERM
   local -a args=(
-    --proxy "$PROXY_URL"
+    --proxy "$plane"
     --tun "$TUN"
     --mtu "$TUN_MTU"
     --dns over-tcp
@@ -1616,6 +1672,7 @@ cmd_up() {
     --bypass "$BYPASS_CIDR"
     --verbosity info
     --exit-on-fatal-error
+    --max-sessions "$MAX_SESSIONS"
   )
   local arg
   for arg in "${args[@]}"; do

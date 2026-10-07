@@ -30,6 +30,8 @@ reject "runner at tailscale" "RUNNER_RULE_PREF=5210" "must sit between"
 reject "desktop at tailscale lookup" "DESKTOP_RULE_PREF=5270" "must follow Tailscale"
 reject "desktop at main" "DESKTOP_RULE_PREF=32766" "must follow Tailscale"
 reject "mark in tailscale mask" "MARK=0x10000" "overlaps the Tailscale"
+reject "session cap" "MAX_SESSIONS=0" "positive integer"
+reject "session cap text" "MAX_SESSIONS=many" "positive integer"
 reject "proxy scheme" "PROXY_URL=https://192.0.2.1:8282" "must start with http://"
 reject "proxy credentials" "PROXY_URL=http://user:secret@192.0.2.1:8282" "must not carry credentials"
 

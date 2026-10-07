@@ -69,6 +69,8 @@ Item {
 
   readonly property string shownProxy: Panel.shownProxy(focusLink, boundProxy)
 
+  readonly property string dataPlaneText: Panel.dataPlaneText(boundProxy, tunnelUp)
+
   readonly property string metaText: Panel.metaText({
     toggleBusy: toggleBusy,
     pendingUp: pendingUp,
@@ -474,6 +476,8 @@ Item {
           InfoValue { text: (root.focusLink && root.focusLink.address) ? String(root.focusLink.address) : (root.boundAddress || "--") }
           InfoLabel { text: "Proxy" }
           InfoValue { text: root.shownProxy || "--" }
+          InfoLabel { text: "Data plane"; visible: root.dataPlaneText !== "" }
+          InfoValue { text: root.dataPlaneText; visible: root.dataPlaneText !== "" }
           InfoLabel { text: "Tunnel" }
           InfoValue { text: root.tunnelValue }
         }

@@ -4,6 +4,7 @@
 # The SSID is not a setting. Do not put a live interface name here.
 
 # PROXY_PORT="8282"
+# PROXY_URL stays an HTTP URL. The tun uses SOCKS5 on that same host and port.
 # PROXY_URL=""
 # BYPASS_CIDR=""
 # IFACE=""
@@ -16,3 +17,6 @@
 # Overrides sudo. Empty, and no sudo user, leaves the tun for `netshare run`.
 # Use a numeric uid. Do not put a name or a host-specific id in this example.
 # NETSHARE_UID=""
+
+# Concurrent tun2proxy sessions. The binary's own default is 200.
+# MAX_SESSIONS="1024"
