@@ -1,7 +1,6 @@
-# netshare
+# netshare-control
 
-Console controller for a NetShare tun. An Omarchy bar panel is optional
-and is not required to bring the tunnel up.
+Client console utility and optional Omarchy status bar control for (NetShare)[https://netshare.app/android].
 
 NetShare tells clients to use an HTTP proxy on the access point's gateway.
 That port also accepts SOCKS5. This tree owns routes, policy routing, and
@@ -18,6 +17,15 @@ not a setting for some other LAN.
 
 The tunnel code is `lib/tunnel.sh`. The panel readout is `lib/bar.sh`.
 The `netshare` command is the console entry and works without the panel.
+
+## About
+
+Without going into great technical detail, I effectively vibe coded this 
+utility so I could use my laptop running Omarchy with (NetShare)[https://netshare.app/android]
+running on my Android phone. Prompted using Grok 4.7 High with adb running
+on a second Android device, connected to the NetShare hotspot running on
+my phone, then getting Grok to basically reverse engineer the app's client
+logic combined with a lot of testing and trial/error until it worked reliably.
 
 ## Dependencies
 
