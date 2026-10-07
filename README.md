@@ -137,6 +137,53 @@ From the bar, a left click opens the panel. The switch runs the same `up` or
 JSON object for the panel and leaves routes alone. Keep either command's
 output out of a commit.
 
+## Settings
+
+`/etc/netshare.conf` is sourced after these defaults. It must be owned by
+root. Assignments use shell syntax, as in `netshare.conf.example`. Leave a
+name out of the file to keep its default. An exported value is kept when the
+file does not assign that name, and the file wins when it does.
+
+Empty `PROXY_URL`, `BYPASS_CIDR`, `IFACE`, and `CONNECTION_PREFIX` mean
+discover.
+
+| Name | Default | Expected | What it does |
+| --- | --- | --- | --- |
+| `PROXY_PORT` | `8282` | TCP port | Port used to build `http://<gateway>:<port>` when `PROXY_URL` is empty. |
+| `PROXY_URL` | empty | `http://host:port` with no user or password, or empty | Pins the proxy. A set value also ignores gateways that are a different host. |
+| `BYPASS_CIDR` | empty | IPv4 CIDR, or empty | On-link prefix that stays off the tun. A set value keeps only a link whose on-link route is that CIDR. |
+| `IFACE` | empty | NetworkManager device name, or empty | Limits the probe to one device. Required when two proxies answer. |
+| `CONNECTION_PREFIX` | empty | start of a connection name, or empty | Used only by `bar`. Empty lists every link the probe accepted. |
+| `NETSHARE_UID` | empty | numeric uid other than `0`, or empty | Account whose traffic follows the tun. Overrides `SUDO_UID`. Empty, with no sudo user, leaves side posture for `netshare run`. |
+| `TUN2PROXY` | `/usr/local/bin/tun2proxy` | path of an executable | The data-plane binary. The environment supplies this default before the conf file is read. |
+| `NETSHARE_PROMPT` | unset | `desktop`, `terminal`, or unset | Unset uses a terminal when there is one, and the desktop dialog otherwise. `desktop` forces the dialog. `terminal` forces the terminal. |
+| `SUDO_ASKPASS` | unset | path of an executable, or unset | Desktop password program. Unset uses `lib/askpass.sh`. |
+| `NETSHARE_PINENTRY` | unset | path of an executable, or unset | pinentry program for `lib/askpass.sh`. Unset tries `pinentry-qt`, then `pinentry-gnome3`. |
+
+`sudo` sets `SUDO_UID` to the account that invoked it. A value of `0` is ignored. The password dialog text is `Password required for netshare: `.
+
+These names are the working defaults. The same conf file can override them. `up` rejects a mark that overlaps `0xff0000`, a rule priority that is not ahead of Tailscale's `5210`, a runner priority that is outside that gap, and a desktop priority that is not between Tailscale's lookup rule at `5270` and the main rule at `32766`.
+
+| Name | Default | Expected | What it does |
+| --- | --- | --- | --- |
+| `TUN` | `ns0` | device name | Tun interface. |
+| `TABLE` | `849` | routing table number | Side table for tun traffic. |
+| `MARK` | `0x849` | fwmark outside `0xff0000` | Mark on packets that use `TABLE`. |
+| `RULE_PREF` | `5000` | integer below `5210` | Priority of the fwmark rule. |
+| `RUNNER_RULE_PREF` | `5010` | integer between `RULE_PREF` and `5210` | Priority of the `RUN_USER` uid rule. |
+| `DESKTOP_RULE_PREF` | `5300` | integer after `5270` and before `32766` | Priority of the selected account's uid rule. |
+| `TUN_MTU` | `10000` | MTU | Tun MTU. |
+| `VIRTUAL_CIDR` | `198.18.0.0/15` | IPv4 CIDR | tun2proxy's virtual address pool. It is not a resolver. |
+| `DNS_SERVER_1` | `8.8.8.8` | IPv4 address | First resolver given to the tun. |
+| `DNS_SERVER_2` | `8.8.4.4` | IPv4 address | Second resolver given to the tun. |
+| `RUN_DNS` | `DNS_SERVER_1` | IPv4 address | Resolver for `netshare run`. |
+| `NETSHARE_PREFIX` | `192.168.49.` | IPv4 prefix text | Client addresses must start with this. The tun address is `10.10.` plus the last two octets. |
+| `NETSHARE_GATEWAY` | `192.168.49.1` | IPv4 address | Proxy gateway. It is not mapped to a tun address. |
+| `RUN_USER` | `netshare` | user name | System user for `netshare run`. Created if missing. |
+| `BAR_ICON` | U+F0EC | one character | Glyph drawn in the bar. |
+
+Runtime files are not settings. State and session bookkeeping live under `/run/netshare`. The tun2proxy log is `/var/log/netshare/tun2proxy.log`. `netshare run` bind-mounts resolver files from `/etc/netshare`. The proxy file for programs that ignore the routing table is `/etc/sysconfig/proxy`.
+
 ## Access point
 
 A connected Wi-Fi or Ethernet link qualifies when its gateway answers as an
