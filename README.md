@@ -52,12 +52,17 @@ Optional. The tun still comes up without them:
 
 ## Console
 
-`up` and `down` need root. A cached sudo ticket is reused. From a terminal,
-sudo asks on that terminal. With no terminal, sudo opens a desktop password
-dialog (`pinentry-qt`, or `pinentry-gnome3`). `SUDO_ASKPASS` overrides that
-helper. The bar sets `NETSHARE_PROMPT=desktop` so the switch uses the dialog
-even when the session still has a terminal. `NETSHARE_PROMPT=terminal` forces
-the terminal prompt.
+`up`, `down`, `run`, `toggle`, and `default` need root. That root creates
+the tun, installs its routes and firewall rules, and points the resolver at
+it. sudo is how an account reaches that root, and the account that ran sudo
+is the one whose traffic then uses the tun. `status` and `bar` only read
+state.
+
+A cached sudo ticket is reused. From a terminal, sudo asks on that terminal.
+With no terminal, sudo opens a desktop password dialog (`pinentry-qt`, or
+`pinentry-gnome3`). `SUDO_ASKPASS` overrides that helper. The bar sets
+`NETSHARE_PROMPT=desktop` so the switch uses the dialog even when the session
+still has a terminal. `NETSHARE_PROMPT=terminal` forces the terminal prompt.
 
 ```
 sudo netshare up
