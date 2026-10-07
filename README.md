@@ -50,7 +50,64 @@ Optional. The tun still comes up without them:
 
 `bash test/run.sh` also needs `node` for `test/panel.js`.
 
-## Console
+## Install
+
+Install the commands listed in Dependencies. `up` checks them before it
+changes routes.
+
+`tun2proxy` is a separate binary. Download the 0.8.4 release named in
+`TUN2PROXY.txt`, check the zip and binary checksums there, then copy the
+binary into place:
+
+```bash
+sudo install -m 0755 tun2proxy /usr/local/bin/tun2proxy
+```
+
+`TUN2PROXY` can name another path.
+
+Put the controller on `PATH`. `~/.local/bin` is the usual place:
+
+```bash
+git clone https://github.com/realchrisolin/netshare-control.git
+cd netshare-control
+ln -s "$PWD/netshare" ~/.local/bin/netshare
+```
+
+Overrides are optional. `/etc/netshare.conf` must be owned by root. Copy the
+example and keep the real file out of git:
+
+```bash
+sudo install -m 0644 -o root -g root netshare.conf.example /etc/netshare.conf
+```
+
+The Omarchy bar is optional. The shell loads `netshare.js` from beside the
+QML file, so symlink both. Add this widget to the bar layout in
+`~/.config/omarchy/shell.json`:
+
+```json
+{ "id": "netshare", "type": "qml" }
+```
+
+```bash
+mkdir -p ~/.config/omarchy/bar/modules
+ln -s "$PWD/bar/netshare.qml" ~/.config/omarchy/bar/modules/netshare.qml
+ln -s "$PWD/bar/netshare.js" ~/.config/omarchy/bar/modules/netshare.js
+```
+
+Restart the shell after the module is in place. Refreshing the shell rewrites
+the rest of the user config, so leave that command alone.
+
+## How to use
+
+Connect to the NetShare access point with NetworkManager. `up` then uses a
+connected link whose gateway answers as an HTTP proxy on port 8282.
+
+```bash
+sudo netshare up
+netshare status
+sudo netshare run curl -sI https://example.com
+sudo netshare down
+```
 
 `up`, `down`, `run`, `toggle`, and `default` need root. That root creates
 the tun, installs its routes and firewall rules, and points the resolver at
@@ -64,14 +121,6 @@ With no terminal, sudo opens a desktop password dialog (`pinentry-qt`, or
 `NETSHARE_PROMPT=desktop` so the switch uses the dialog even when the session
 still has a terminal. `NETSHARE_PROMPT=terminal` forces the terminal prompt.
 
-```
-sudo netshare up
-netshare status
-sudo netshare run curl -sI https://example.com
-sudo netshare default off
-sudo netshare down
-```
-
 `sudo netshare up` from an account sends that account through the tun after
 public DNS through the tun succeeds. The main-table default stays where
 NetworkManager put it. Root with no account selected still brings the tun up,
@@ -80,20 +129,13 @@ leaves the host resolver alone, and limits the tun to `netshare run`.
 To choose the account from a root shell, set `NETSHARE_UID` in
 `/etc/netshare.conf` to that account's numeric uid. `netshare default on`
 installs the same uid rule later. `netshare default off` removes it and
-leaves the tun up for `netshare run`.
+leaves the tun up for `netshare run`. `toggle` brings the tun up, or down if
+it is already up.
 
-```
-sudo netshare up
-sudo netshare down
-netshare status
-netshare bar
-sudo netshare toggle
-sudo netshare run curl -sI https://example.com
-sudo netshare default on|off
-```
-
-`status` prints the live link. `bar` prints one JSON object and does not
-change routes. Neither command's output belongs in a commit.
+From the bar, a left click opens the panel. The switch runs the same `up` or
+`down`. `netshare status` prints the live link. `netshare bar` prints one
+JSON object for the panel and leaves routes alone. Keep either command's
+output out of a commit.
 
 ## Access point
 
@@ -119,23 +161,11 @@ programs that ignore the routing table. That is `/etc/sysconfig/proxy`, the
 account's user environment when a session bus exists, and gsettings when
 `gsettings` is installed. A host without those still gets the tun.
 
-## Install
-
-Symlink the controller onto `PATH`:
-
-```bash
-ln -s /path/to/netshare/netshare ~/.local/bin/netshare
-```
-
-Optional overrides live in `/etc/netshare.conf`, which must be owned by root.
-See `netshare.conf.example`. Copy it and keep the real file out of git.
-
-`tun2proxy` belongs at `/usr/local/bin/tun2proxy`, or set `TUN2PROXY`. See Dependencies.
-
 ## Omarchy bar
 
-`bar/netshare.qml` is an optional bar module. Left click opens the panel and
-does not start the tunnel. The switch runs `netshare up` or `netshare down`.
+`bar/netshare.qml` is an optional bar module. Install covers the symlinks
+and the shell restart. Left click opens the panel and leaves the tunnel as
+it is. The switch runs `netshare up` or `netshare down`.
 
 The hero names the focused connection. The status line is Desktop or Side
 while the tunnel is up (`desktop` and `side` are the posture values), and
@@ -144,19 +174,7 @@ adapter, address, proxy host:port, and the tun address. While the tunnel is
 up or the saved state is stale, those rows stay on the bound adapter.
 
 The module polls `netshare bar`. Saving the QML does not reload a running
-shell. Symlink the panel and add only this widget entry:
-
-```json
-{ "id": "netshare", "type": "qml" }
-```
-
-```bash
-ln -s /path/to/netshare/bar/netshare.qml \
-  ~/.config/omarchy/bar/modules/netshare.qml
-```
-
-Restart the shell after the module is in place. Do not refresh the shell
-over the rest of the user config.
+shell.
 
 ## Tests
 
