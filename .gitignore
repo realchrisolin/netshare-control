@@ -1,0 +1,4 @@
+*~
+*.swp
+*.conf
+!netshare.conf.example

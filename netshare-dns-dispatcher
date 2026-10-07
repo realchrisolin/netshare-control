@@ -1,0 +1,31 @@
+#!/bin/bash
+# NetworkManager calls this with the interface name and the action.
+# A renew on some other link must not tear the tunnel down. The
+# transport interface going away must restore DNS even if that
+# interface is already gone.
+#
+# `netshare up` installs a generated copy under NetworkManager's
+# dispatcher directory with the controller path filled in. This source
+# file finds the sibling controller when it is run from the repo.
+
+here=$(readlink -f "$0")
+here=${here%/*}
+if [[ -x "${here}/netshare" ]]; then
+  bin="${here}/netshare"
+elif [[ -n "${NETSHARE_BIN:-}" && -x "$NETSHARE_BIN" ]]; then
+  bin=$NETSHARE_BIN
+else
+  bin=$(command -v netshare || true)
+fi
+[[ -n "${bin}" ]] || exit 1
+
+iface=${1:-}
+action=${2:-}
+case "$action" in
+  pre-down|down)
+    exec "$bin" transport-down "$iface"
+    ;;
+  *)
+    exec "$bin" dns-reassert
+    ;;
+esac

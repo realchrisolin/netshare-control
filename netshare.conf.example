@@ -1,0 +1,13 @@
+# Optional. Copy to /etc/netshare.conf and keep it owned by root.
+# The script refuses to source a config that is not root-owned.
+# Leave these unset to discover a NetShare access point by its gateway proxy.
+# The SSID is not a setting. Do not put a live interface name here.
+
+# PROXY_PORT="8282"
+# PROXY_URL=""
+# BYPASS_CIDR=""
+# IFACE=""
+
+# Only `netshare bar` uses this. Empty lists every link the probe accepted.
+# A non-empty value is a NetworkManager connection-name prefix.
+# CONNECTION_PREFIX=""

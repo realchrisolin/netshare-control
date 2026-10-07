@@ -1,0 +1,9 @@
+tun2proxy 0.8.4
+source: https://github.com/tun2proxy/tun2proxy/releases/download/v0.8.4/tun2proxy-x86_64-unknown-linux-musl.zip
+commit: 6210902 (2026-09-30)
+installed: /usr/local/bin/tun2proxy
+zip_sha256: 34a0fd19390f438da786c14223358d89f3d959ee61acefc35ceb8a693697fbce
+binary_sha256: badd2f8e93c3524f8df3dac8a05261815dccc5cbaf2e08eb7dd6ee5375db62a6
+attestation: gh attestation verify --owner tun2proxy
+link: static-pie musl
+note: AUR tun2proxy was 0.8.3 and builds with cargo. This is the upstream 0.8.4 binary.
