@@ -122,9 +122,10 @@ With no terminal, sudo opens a desktop password dialog (`pinentry-qt`, or
 still has a terminal. `NETSHARE_PROMPT=terminal` forces the terminal prompt.
 
 `sudo netshare up` from an account sends that account through the tun after
-public DNS through the tun succeeds. The main-table default stays where
-NetworkManager put it. Root with no account selected still brings the tun up,
-leaves the host resolver alone, and limits the tun to `netshare run`.
+a lookup through the tun returns a public address. The resolvers on that
+path are Cloudflare's `1.1.1.1` and `1.0.0.1`. The main-table default stays
+where NetworkManager put it. Root with no account selected still brings the
+tun up, leaves the host resolver alone, and limits the tun to `netshare run`.
 
 To choose the account from a root shell, set `NETSHARE_UID` in
 `/etc/netshare.conf` to that account's numeric uid. `netshare default on`
@@ -174,9 +175,10 @@ These names are the working defaults. The same conf file can override them. `up`
 | `DESKTOP_RULE_PREF` | `5300` | integer after `5270` and before `32766` | Priority of the selected account's uid rule. |
 | `TUN_MTU` | `10000` | MTU | Tun MTU. |
 | `VIRTUAL_CIDR` | `198.18.0.0/15` | IPv4 CIDR | tun2proxy's virtual address pool. It is not a resolver. |
-| `DNS_SERVER_1` | `8.8.8.8` | IPv4 address | First resolver given to the tun. |
-| `DNS_SERVER_2` | `8.8.4.4` | IPv4 address | Second resolver given to the tun. |
+| `DNS_SERVER_1` | `1.1.1.1` | IPv4 address | First resolver given to the tun. Cloudflare's primary public resolver. |
+| `DNS_SERVER_2` | `1.0.0.1` | IPv4 address | Second resolver given to the tun. Cloudflare's secondary public resolver. |
 | `RUN_DNS` | `DNS_SERVER_1` | IPv4 address | Resolver for `netshare run`. |
+| `ROUTE_PROBE` | `9.9.9.9` | IPv4 address other than either DNS server | Address used to ask which device a normal lookup uses. The DNS servers already have host routes into the tun. |
 | `NETSHARE_PREFIX` | `192.168.49.` | IPv4 prefix text | Client addresses must start with this. The tun address is `10.10.` plus the last two octets. |
 | `NETSHARE_GATEWAY` | `192.168.49.1` | IPv4 address | Proxy gateway. It is not mapped to a tun address. |
 | `RUN_USER` | `netshare` | user name | System user for `netshare run`. Created if missing. |
@@ -202,6 +204,13 @@ kernel picks a source address. A mark set in a later netfilter hook is not
 enough for that. The main-table default stays in place. There are no `/1`
 routes. systemd-resolved is not pointed at `198.18.0.1`. ICMP, QUIC, and
 arbitrary UDP are out of scope.
+
+The tun's resolvers are `DNS_SERVER_1` and `DNS_SERVER_2`, Cloudflare's
+`1.1.1.1` and `1.0.0.1`, with opportunistic DNS-over-TLS. `up` installs a
+host route for each into the tun before it installs the account rule.
+`netshare run` queries `DNS_SERVER_1`. `ROUTE_PROBE` (`9.9.9.9`) is a
+different public address, used only to see which device a normal lookup
+uses, because the resolver addresses already point at the tun.
 
 When an account is selected, `up` also publishes the access-point proxy for
 programs that ignore the routing table. That is `/etc/sysconfig/proxy`, the

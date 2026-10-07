@@ -13,7 +13,7 @@
 # keeps the local address that starts with 192.168.49. and stores the literal
 # 192.168.49.1 as the gateway. startVPN splits that local address and
 # concatenates 10.10. with the last two octets. Builder.addAddress installs
-# it with prefix 32, setMtu(10000), and DNS 8.8.8.8 and 8.8.4.4. excludeRoute
+# it with prefix 32 and setMtu(10000). excludeRoute
 # keeps the 192.168.49.0/24 prefix on the radio. 198.18.0.0/15 is tun2proxy's
 # virtual pool, not a resolver, and this script does not point systemd-resolved
 # at it.
@@ -24,8 +24,8 @@
 # back to the radio). tun2proxy itself stays unmarked on the main table, so
 # its proxy socket is sourced from the access-point address.
 #
-# DNS is 8.8.8.8 and 8.8.4.4 with opportunistic DNS-over-TLS, which is the
-# mode the watch validated. Those two addresses get host routes into the tun
+# DNS is Cloudflare's public resolvers, 1.1.1.1 and 1.0.0.1, with
+# opportunistic DNS-over-TLS. Those two addresses get host routes into the tun
 # before any desktop rule exists. ns0's routing domain "~." keeps global
 # lookups on the tun. Other links stay DNS default routes so NetworkManager
 # can still resolve a name on that interface. If the lookup does not return a
@@ -79,9 +79,12 @@ RUNNER_RULE_PREF="5010"
 DESKTOP_RULE_PREF="5300"
 TUN_MTU="10000"
 VIRTUAL_CIDR="198.18.0.0/15"
-# Watch VPN resolvers. RUN_DNS is what `netshare run` queries over TCP.
-DNS_SERVER_1="8.8.8.8"
-DNS_SERVER_2="8.8.4.4"
+# Cloudflare public resolvers. RUN_DNS is what `netshare run` queries over TCP.
+DNS_SERVER_1="1.1.1.1"
+DNS_SERVER_2="1.0.0.1"
+# Public address used only for route lookups. It must not be either DNS
+# server: those have host routes into the tun before the desktop rule exists.
+ROUTE_PROBE="9.9.9.9"
 # vpn.setAddress stores this literal gateway. The client address has to
 # start with the same prefix and be a different host.
 NETSHARE_PREFIX="192.168.49."
@@ -1248,9 +1251,9 @@ probe_marked_http() {
 }
 
 # Gate 2. Host routes only. The desktop uid rule is not installed yet,
-# so 1.1.1.1 must still follow the main-table default.
+# so ROUTE_PROBE must still follow the main-table default.
 verify_dns_gate() {
-  local out="" via="" ip_re
+  local out="" via="" ip_re dns1_re dns2_re
   resolvectl reset-server-features >/dev/null 2>&1 || true
   resolvectl flush-caches >/dev/null 2>&1 || true
   if ! out=$(timeout 20 resolvectl query -4 example.com 2>&1); then
@@ -1287,9 +1290,11 @@ verify_dns_gate() {
     return 1
   fi
   ip_re=${tun_ip//./\\.}
+  dns1_re=${DNS_SERVER_1//./\\.}
+  dns2_re=${DNS_SERVER_2//./\\.}
   local _
   for _ in 1 2 3 4 5 6 7 8; do
-    if grep -E "TCP ${ip_re}:[0-9]+ -> (8\\.8\\.8\\.8|8\\.8\\.4\\.4):853" "$LOG" >/dev/null 2>&1; then
+    if grep -E "TCP ${ip_re}:[0-9]+ -> (${dns1_re}|${dns2_re}):853" "$LOG" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.4
@@ -1321,9 +1326,9 @@ probe_desktop_http() {
 
 verify_desktop_gate() {
   local dev="" main_via="" main_dev="" domain="" saved_link="" shown="" qout="" lan_prefix="" v6="" mark code_ok=0
-  dev=$(route_dev 1.1.1.1 "$desktop_uid")
+  dev=$(route_dev "$ROUTE_PROBE" "$desktop_uid")
   if [[ "$dev" != "$TUN" ]]; then
-    echo "netshare: desktop route to 1.1.1.1 is ${dev:-missing}" >&2
+    echo "netshare: desktop route to ${ROUTE_PROBE} is ${dev:-missing}" >&2
     return 1
   fi
   dev=$(route_dev "$gateway" "$desktop_uid")
@@ -1340,9 +1345,9 @@ verify_desktop_gate() {
       return 1
     fi
   fi
-  dev=$(route_dev 1.1.1.1)
+  dev=$(route_dev "$ROUTE_PROBE")
   if [[ "$dev" == "$TUN" || "$dev" == "$iface" ]]; then
-    echo "netshare: unmarked route to 1.1.1.1 uses ${dev}" >&2
+    echo "netshare: unmarked route to ${ROUTE_PROBE} uses ${dev}" >&2
     return 1
   fi
   domain=$(awk -F '\t' 'NF >= 3 && $3 != "" { print $3; exit }' "$DNS_LINKS_FILE" 2>/dev/null | awk '{ print $1; exit }' || true)
@@ -1703,8 +1708,8 @@ cmd_up() {
   if ! verify_dns_gate; then
     fail_up "resolver did not return a public address through the tun; desktop default was not changed"
   fi
-  if [[ "$(route_dev 1.1.1.1)" == "$TUN" ]]; then
-    fail_up "1.1.1.1 already uses ${TUN} before the desktop rule"
+  if [[ "$(route_dev "$ROUTE_PROBE")" == "$TUN" ]]; then
+    fail_up "${ROUTE_PROBE} already uses ${TUN} before the desktop rule"
   fi
   if [[ "$(route_dev "$gateway")" != "$iface" ]]; then
     fail_up "gateway ${gateway} left ${iface} during DNS setup"
