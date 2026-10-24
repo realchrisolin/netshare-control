@@ -86,7 +86,8 @@ TUN_MTU="10000"
 # its 600s timeout, and --exit-on-fatal-error then quits the process.
 MAX_SESSIONS="1024"
 VIRTUAL_CIDR="198.18.0.0/15"
-# Cloudflare public resolvers. RUN_DNS is what `netshare run` queries over TCP.
+# Cloudflare public resolvers. RUN_DNS is the first server `netshare run`
+# queries. DNS_SERVER_2 is the fallback. See runner_resolv_text.
 DNS_SERVER_1="1.1.1.1"
 DNS_SERVER_2="1.0.0.1"
 # Public address used only for route lookups. It must not be either DNS
@@ -464,12 +465,27 @@ ensure_user() {
   fi
 }
 
+# Text of the resolv.conf bind-mounted for `netshare run` and for the
+# transport probe. tun2proxy turns a UDP query into a SOCKS TCP session and
+# logs that session before the handshake finishes. A 2 second resolver
+# timeout expired during that handshake, the probe failed, and `up` removed
+# the tunnel. Eight seconds is the probe's connect timeout. A second server
+# is a different UDP flow, so a handshake stuck on the first server does
+# not consume the retry.
+runner_resolv_text() {
+  printf 'nameserver %s\n' "$RUN_DNS"
+  if [[ "$DNS_SERVER_1" != "$RUN_DNS" ]]; then
+    printf 'nameserver %s\n' "$DNS_SERVER_1"
+  fi
+  if [[ "$DNS_SERVER_2" != "$RUN_DNS" && "$DNS_SERVER_2" != "$DNS_SERVER_1" ]]; then
+    printf 'nameserver %s\n' "$DNS_SERVER_2"
+  fi
+  printf '%s\n' 'options timeout:8 attempts:1 single-request-reopen'
+}
+
 ensure_etc() {
   install -d -m 0755 "$ETC_DIR"
-  cat >"${ETC_DIR}/resolv.conf" <<EOF
-nameserver ${RUN_DNS}
-options timeout:2 attempts:2 single-request-reopen
-EOF
+  runner_resolv_text >"${ETC_DIR}/resolv.conf"
   cat >"${ETC_DIR}/nsswitch.conf" <<'EOF'
 passwd: files
 group: files
@@ -1278,15 +1294,26 @@ start_reap() {
 # Gate 1. The netshare user is marked into table 849. Do not call
 # `netshare run` here: this process holds the lock, and run takes it too.
 probe_marked_http() {
-  local code=""
+  local code="" errfile="" err=""
+  probe_detail=""
+  errfile=$(mktemp)
+  # max-time covers an 8s wait on each resolver plus the connect.
   if ! code=$(unshare --mount --propagation private "$SCRIPT" --inside-run \
       curl -4 -sS -o /dev/null -w '%{http_code}' \
-        --connect-timeout 8 --max-time 20 \
-        https://example.com); then
-    echo "netshare: transport curl failed (${code:-no status})" >&2
+        --connect-timeout 8 --max-time 25 \
+        https://example.com 2>"$errfile"); then
+    err=$(tr '\n' ' ' <"$errfile" | sed 's/[[:space:]]*$//')
+    rm -f "$errfile"
+    probe_detail="curl failed (${code:-no status})"
+    [[ -n "$err" ]] && probe_detail+=": ${err}"
     return 1
   fi
-  [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+  rm -f "$errfile"
+  if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+    return 0
+  fi
+  probe_detail="HTTP ${code:-no status}"
+  return 1
 }
 
 # Gate 2. Host routes only. The desktop uid rule is not installed yet,
@@ -1740,7 +1767,7 @@ cmd_up() {
     fail_up "gateway ${gateway} is not on ${iface}"
   fi
   if ! probe_marked_http; then
-    fail_up "transport through the access-point proxy failed"
+    fail_up "transport through the access-point proxy failed${probe_detail:+ (${probe_detail})}"
   fi
 
   # No account to move. Leave the host resolver alone. `netshare run` uses
