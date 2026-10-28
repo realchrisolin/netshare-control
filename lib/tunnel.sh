@@ -1218,6 +1218,34 @@ restore_dns() {
   resolvectl flush-caches >/dev/null 2>&1 || true
 }
 
+# NetworkManager adopts a new tun and sends its connectivity check into it.
+# Those sessions stay open on the phone proxy when the SOCKS handshake does
+# not finish, and the transport probe then fails while a direct request to
+# the same proxy still succeeds. Mark the tun unmanaged before it appears.
+nm_unmanaged_rule() {
+  printf '%s\n' "ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"${TUN}\", ENV{NM_UNMANAGED}=\"1\", ENV{ID_NET_MANAGED}=\"0\""
+}
+
+ensure_nm_unmanaged() {
+  [[ "$TUN" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  local dst=/etc/udev/rules.d/99-netshare-tun.rules tmp
+  tmp=$(mktemp)
+  nm_unmanaged_rule >"$tmp"
+  if [[ ! -f "$dst" ]] || ! cmp -s "$tmp" "$dst"; then
+    install -m 0644 "$tmp" "$dst"
+  fi
+  rm -f "$tmp"
+  udevadm control --reload-rules >/dev/null 2>&1 || true
+}
+
+release_tun_from_nm() {
+  local managed
+  managed=$(nmcli -g GENERAL.NM-MANAGED device show "$TUN" 2>/dev/null || true)
+  [[ "$managed" == "yes" ]] || return 0
+  nmcli device set "$TUN" managed no >/dev/null 2>&1 || true
+  sleep 0.3
+}
+
 ensure_dispatcher() {
   # The repo file stays free of this machine's path. The installed copy
   # execs the resolved controller so NetworkManager's PATH does not matter.
@@ -1697,6 +1725,7 @@ cmd_up() {
   ensure_user
   ensure_etc
   ensure_dispatcher
+  ensure_nm_unmanaged || fail_up "could not keep NetworkManager off ${TUN}"
   install -d -m 0755 "$LOG_DIR"
   : >"$LOG"
   chmod 0644 "$LOG"
@@ -1746,6 +1775,7 @@ cmd_up() {
     tail -n 40 "$LOG" >&2 || true
     fail_up "${TUN} did not come up"
   fi
+  release_tun_from_nm
   sysctl -q -w "net.ipv6.conf.${TUN}.disable_ipv6=1" || true
   ip link set dev "$TUN" mtu "$TUN_MTU" up
   # A /32 is a local address. It does not install a connected subnet.

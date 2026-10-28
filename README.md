@@ -233,7 +233,7 @@ kernel picks a source address. `RUN_USER` has a separate uid rule, used by
 `netshare run` and by the check `up` makes before that account is moved. A
 mark set in a later netfilter hook is not enough for that. The main-table default stays in place. There are no `/1`
 routes. systemd-resolved is not pointed at `198.18.0.1`. TCP and UDP go
-through the SOCKS5 proxy. ICMP does not.
+through the SOCKS5 proxy. ICMP does not. `up` keeps NetworkManager off the tun, so its connectivity check is not sent through the phone.
 
 The tun's resolvers are `DNS_SERVER_1` and `DNS_SERVER_2`, Cloudflare's
 `1.1.1.1` and `1.0.0.1`, with opportunistic DNS-over-TLS. `up` installs a
