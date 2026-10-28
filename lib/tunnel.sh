@@ -27,13 +27,19 @@
 # back to the radio). tun2proxy itself stays unmarked on the main table, so
 # its proxy socket is sourced from the access-point address.
 #
-# DNS is Cloudflare's public resolvers, 1.1.1.1 and 1.0.0.1, with
-# opportunistic DNS-over-TLS. Those two addresses get host routes into the tun
-# before any desktop rule exists. ns0's routing domain "~." keeps global
-# lookups on the tun. Other links stay DNS default routes so NetworkManager
-# can still resolve a name on that interface. If the lookup does not return a
-# public address, up removes what it added and leaves the built-in resolver
-# in place.
+# DNS is Cloudflare's public resolvers, 1.1.1.1 and 1.0.0.1. The transport
+# check asks both over HTTPS (port 443) through the tun before it opens any
+# TCP port 53 socket. Port 53 can sit unanswered while the access point can
+# already fetch a page, and a hung port 53 session stays until that data
+# plane exits. Another data plane does not change that.
+# Desktop lookups go to a forwarder on the tun address. That forwarder runs
+# as the tunnel user and uses the same HTTPS path, so it does not need a
+# second default route. The two resolver addresses still get host
+# routes into the tun before any desktop rule exists. ns0's routing domain
+# "~." keeps global lookups on the tun. Other links stay DNS default routes
+# so NetworkManager can still resolve a name on that interface. If the lookup
+# does not return a public address, up removes what it added and leaves the
+# built-in resolver in place.
 #
 # The watch client uses SOCKS on 192.168.49.1 port 8282, which is why UDP
 # works there. tun2proxy uses that same SOCKS5 endpoint. While the desktop
@@ -99,6 +105,13 @@ DNS_SERVER_2="1.0.0.1"
 # second resolver. Each probe query is its own TCP socket, with this budget,
 # and a failed check is repeated.
 DNS_QUERY_TIMEOUT=3
+PROBE_ATTEMPTS=3
+PROBE_PAUSE=1
+# A SOCKS session that never finishes is dropped only when tun2proxy exits.
+# While a direct request to the access point still succeeds, up replaces
+# that process and probes again, up to this many generations. The DNS gate
+# uses the same bound.
+ENGINE_TRIES=3
 # Public address used only for route lookups. It must not be either DNS
 # server: those have host routes into the tun before the desktop rule exists.
 ROUTE_PROBE="9.9.9.9"
@@ -124,6 +137,7 @@ CONF="/etc/netshare.conf"
 DNS_LINKS_FILE="${RUN_DIR}/dns-links"
 SESSION_PROXY_FILE="${RUN_DIR}/session-proxy"
 SESSION_ENV_FILE="${RUN_DIR}/session-env"
+DOH_PID="${RUN_DIR}/doh.pid"
 # libproxy's GNOME plugin stays disabled unless XDG_CURRENT_DESKTOP contains
 # GNOME, MATE, Pantheon, or Cinnamon. This file is the plugin it does read.
 SYSCONFIG_PROXY="/etc/sysconfig/proxy"
@@ -140,6 +154,9 @@ fi
 
 SCRIPT=$(readlink -f "$0")
 pid=""
+# cmd_up's plane is local. A later restart runs in another function and
+# cannot see that local, so the SOCKS URL is kept here.
+engine_plane=""
 iface=""
 src=""
 tun_addr=""
@@ -428,6 +445,7 @@ teardown() {
   restore_session_proxy
   remove_gateway_shadow
   restore_dns
+  stop_doh_forwarder
   delete_dns_host_routes
   delete_desktop_rules
   nft delete table ip netshare >/dev/null 2>&1
@@ -913,6 +931,7 @@ route_dev() {
   fi
 }
 
+# stdin is `ip -o -4 addr` lines. Prints the interface holding $1.
 iface_holding_address() {
   local gw=$1
   awk -v gw="$gw" '$3 == "inet" { split($4, a, "/"); if (a[1] == gw) { print $2; exit } }'
@@ -1080,24 +1099,6 @@ probe_restore_shadow() {
   probe_accept_dev=""
 }
 
-# True when a neighbor inside the phone subnet was learned on another device.
-# The desktop table would otherwise send it out the phone link.
-keep_foreign_bypass_host() {
-  local ipaddr=$1 dev=$2 nud=$3 ap=$4 tun=$5 bypass=$6
-  [[ "$ipaddr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  [[ "$dev" =~ ^[A-Za-z0-9._-]+$ && "$dev" != "$ap" && "$dev" != "$tun" ]] || return 1
-  case "$nud" in
-    REACHABLE|STALE|DELAY|PROBE|PERMANENT) ;;
-    *) return 1 ;;
-  esac
-  python3 -c '
-import ipaddress, sys
-host = ipaddress.ip_address(sys.argv[1])
-net = ipaddress.ip_network(sys.argv[2], strict=False)
-sys.exit(0 if host in net and host != net.network_address and host != net.broadcast_address else 1)
-' "$ipaddr" "$bypass"
-}
-
 dns_status_words() {
   # $1 link, $2 label ("DNS Servers" or "DNS Domain")
   local link=$1 label=$2
@@ -1172,10 +1173,18 @@ apply_tunnel_dns() {
   if [[ -n "${iface:-}" ]] && ip link show "$iface" >/dev/null 2>&1; then
     resolvectl default-route "$iface" false || return 1
   fi
-  resolvectl dns "$TUN" "$DNS_SERVER_1" "$DNS_SERVER_2" || return 1
+  # The forwarder listens on the tun address and asks the public resolvers
+  # over HTTPS. DNS-over-TLS on this link would send port 853 at that
+  # forwarder, which speaks ordinary DNS.
+  [[ -n "$tun_ip" ]] || return 1
+  if [[ ! -f "$DOH_PID" ]] || ! kill -0 "$(<"$DOH_PID")" 2>/dev/null; then
+    echo "netshare: DNS forwarder is not running" >&2
+    return 1
+  fi
+  resolvectl dns "$TUN" "$tun_ip" || return 1
   resolvectl domain "$TUN" '~.' || return 1
   resolvectl default-route "$TUN" true || return 1
-  resolvectl dnsovertls "$TUN" opportunistic || return 1
+  resolvectl dnsovertls "$TUN" no || return 1
 }
 
 desktop_bus() {
@@ -1463,6 +1472,132 @@ release_tun_from_nm() {
   sleep 0.3
 }
 
+# One direct request through the access-point proxy, bound to the client
+# address so it cannot enter the tun. Proves the phone has upstream.
+proxy_upstream_ok() {
+  local code
+  [[ -n "$src" && -n "$PROXY_URL" ]] || return 1
+  code=$(curl -4 -sS -o /dev/null -w '%{http_code}' \
+    --interface "$src" \
+    --proxy "$PROXY_URL" \
+    --connect-timeout 4 --max-time 8 \
+    https://example.com 2>/dev/null) || return 1
+  [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+}
+
+launch_engine() {
+  local plane=$1 ready=0 i
+  # tun2proxy must not inherit the lock fd. An inherited flock stays
+  # held for the life of the process, and later up/down/run block on it.
+  setsid "$TUN2PROXY" \
+    --proxy "$plane" \
+    --tun "$TUN" \
+    --mtu "$TUN_MTU" \
+    --dns over-tcp \
+    --dns-addr "$DNS_SERVER_1" \
+    --bypass "$BYPASS_CIDR" \
+    --verbosity info \
+    --exit-on-fatal-error \
+    --max-sessions "$MAX_SESSIONS" \
+    >>"$LOG" 2>&1 </dev/null 9>&- &
+  pid=$!
+  printf '%s\n' "$pid" >"${RUN_DIR}/pid"
+  for ((i = 0; i < 50; i++)); do
+    if ! pid_alive; then
+      echo "netshare: tun2proxy exited" >&2
+      tail -n 40 "$LOG" >&2 || true
+      return 1
+    fi
+    if ip link show "$TUN" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+  done
+  if (( ready == 0 )); then
+    echo "netshare: ${TUN} did not appear" >&2
+    tail -n 40 "$LOG" >&2 || true
+    return 1
+  fi
+  release_tun_from_nm
+  ip link show "$TUN" >/dev/null 2>&1
+}
+
+stop_engine() {
+  local _
+  if pid_alive; then
+    kill -INT "$pid" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      pid_alive || break
+      sleep 0.2
+    done
+    if pid_alive; then
+      kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+  fi
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    ip link show "$TUN" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  ip link del "$TUN" >/dev/null 2>&1 || true
+  if ip link show "$TUN" >/dev/null 2>&1; then
+    return 1
+  fi
+}
+
+# True when a neighbor inside the phone subnet was learned on another device.
+# The desktop table would otherwise send it out the phone link.
+keep_foreign_bypass_host() {
+  local ipaddr=$1 dev=$2 nud=$3 ap=$4 tun=$5 bypass=$6
+  [[ "$ipaddr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  [[ "$dev" =~ ^[A-Za-z0-9._-]+$ && "$dev" != "$ap" && "$dev" != "$tun" ]] || return 1
+  case "$nud" in
+    REACHABLE|STALE|DELAY|PROBE|PERMANENT) ;;
+    *) return 1 ;;
+  esac
+  python3 -c '
+import ipaddress, sys
+host = ipaddress.ip_address(sys.argv[1])
+net = ipaddress.ip_network(sys.argv[2], strict=False)
+sys.exit(0 if host in net and host != net.network_address and host != net.broadcast_address else 1)
+' "$ipaddr" "$bypass"
+}
+
+install_foreign_bypass_hosts() {
+  local ipaddr dev nud src_on
+  [[ -n "$BYPASS_CIDR" && -n "$iface" ]] || return 0
+  while read -r ipaddr dev nud; do
+    keep_foreign_bypass_host "$ipaddr" "$dev" "$nud" "$iface" "$TUN" "$BYPASS_CIDR" || continue
+    src_on=$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+    [[ "$src_on" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    ip route replace table "$TABLE" "${ipaddr}/32" dev "$dev" src "$src_on" || return 1
+  done < <(ip -4 neigh show | awk '{
+    dev = ""
+    for (i = 1; i <= NF; i++) if ($i == "dev") dev = $(i + 1)
+    if (dev != "") print $1, dev, $NF
+  }')
+}
+
+configure_tun_link() {
+  sysctl -q -w "net.ipv6.conf.${TUN}.disable_ipv6=1" || true
+  ip link set dev "$TUN" mtu "$TUN_MTU" up
+  ip addr replace "${tun_ip}/32" dev "$TUN"
+  tun_addr="${tun_ip}/32"
+  ip route replace table "$TABLE" "$BYPASS_CIDR" dev "$iface" src "$src" || return 1
+  ip route replace table "$TABLE" "${tun_ip}/32" dev "$TUN" || return 1
+  ip route replace table "$TABLE" default dev "$TUN" src "$tun_ip" || return 1
+  install_foreign_bypass_hosts || return 1
+}
+
+# New tun2proxy process, same routes. Does not touch nft or the uid rules.
+restart_dataplane() {
+  stop_engine || return 1
+  launch_engine "$engine_plane" || return 1
+  configure_tun_link || return 1
+  write_state || return 1
+  [[ "$(proxy_route_dev)" == "$iface" ]]
+}
+
 ensure_dispatcher() {
   # The repo file stays free of this machine's path. The installed copy
   # execs the resolved controller so NetworkManager's PATH does not matter.
@@ -1500,6 +1635,8 @@ cmd_dns_reassert() {
   set +e
   if [[ -n "$tun_ip" ]]; then
     install_dns_host_routes
+    start_doh_forwarder || exit 1
+    point_runner_at_forwarder || exit 1
   fi
   apply_tunnel_dns
   exit 0
@@ -1549,28 +1686,601 @@ start_reap() {
   setsid "$SCRIPT" reap >>"${LOG_DIR}/reap.log" 2>&1 </dev/null 9>&- &
 }
 
-# Gate 1. The netshare user is marked into table 849. Do not call
-# `netshare run` here: this process holds the lock, and run takes it too.
-probe_marked_http() {
-  local code="" errfile="" err=""
-  probe_detail=""
-  errfile=$(mktemp)
-  # max-time covers an 8s wait on each resolver plus the connect.
-  if ! code=$(unshare --mount --propagation private "$SCRIPT" --inside-run \
-      curl -4 -sS -o /dev/null -w '%{http_code}' \
-        --connect-timeout 8 --max-time 25 \
-        https://example.com 2>"$errfile"); then
-    err=$(tr '\n' ' ' <"$errfile" | sed 's/[[:space:]]*$//')
-    rm -f "$errfile"
-    probe_detail="curl failed (${code:-no status})"
-    [[ -n "$err" ]] && probe_detail+=": ${err}"
+# TCP DNS A query. argv: server, name, timeout seconds, optional port.
+# Port 53 is the resolver. A client TCP session is proxied as an ordinary
+# tun2proxy TCP flow. The DNS-over-TCP helper is only used for UDP/53.
+DNS_A_QUERY=$(cat <<'PY'
+import socket, struct, sys, time
+
+def encode(name):
+    out = b''
+    for part in name.rstrip('.').split('.'):
+        try:
+            raw = part.encode('ascii')
+        except UnicodeEncodeError:
+            return None
+        if not raw or len(raw) > 63:
+            return None
+        out += bytes([len(raw)]) + raw
+    return out + b'\x00'
+
+def skip_name(data, i):
+    hops = 0
+    while hops < 16:
+        if i >= len(data):
+            raise ValueError('name')
+        n = data[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            if i + 1 >= len(data):
+                raise ValueError('pointer')
+            return i + 2
+        if n & 0xC0:
+            raise ValueError('label')
+        nxt = i + 1 + n
+        if nxt > len(data):
+            raise ValueError('label')
+        i = nxt
+        hops += 1
+    raise ValueError('loop')
+
+def recvall(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return buf
+
+def query():
+    if len(sys.argv) not in (4, 5):
+        return 1
+    server, qname = sys.argv[1], sys.argv[2]
+    timeout = float(sys.argv[3])
+    port = int(sys.argv[4]) if len(sys.argv) == 5 else 53
+    if not (0 < timeout <= 60) or not (0 < port < 65536):
+        return 1
+    qn = encode(qname)
+    if qn is None:
+        return 1
+    msg = b'\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00' + qn + b'\x00\x01\x00\x01'
+    if len(msg) > 512:
+        return 1
+    deadline = time.monotonic() + timeout
+    sock = socket.create_connection((server, port), timeout)
+    try:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return 1
+        sock.settimeout(left)
+        sock.sendall(struct.pack('!H', len(msg)) + msg)
+        length = struct.unpack('!H', recvall(sock, 2))[0]
+        if length < 12 or length > 4096:
+            return 1
+        data = recvall(sock, length)
+    finally:
+        sock.close()
+    if data[3] & 0x0F:
+        return 1
+    qdcount, ancount = struct.unpack('!HH', data[4:8])
+    i = 12
+    for _ in range(qdcount):
+        i = skip_name(data, i)
+        if i + 4 > len(data):
+            return 1
+        i += 4
+    for _ in range(ancount):
+        i = skip_name(data, i)
+        if i + 10 > len(data):
+            return 1
+        typ, clas, _ttl, rdlen = struct.unpack('!HHIH', data[i:i + 10])
+        i += 10
+        if i + rdlen > len(data):
+            return 1
+        rdata = data[i:i + rdlen]
+        i += rdlen
+        if typ == 1 and clas == 1 and rdlen == 4:
+            sys.stdout.write('%d.%d.%d.%d\n' % (rdata[0], rdata[1], rdata[2], rdata[3]))
+            return 0
     return 1
-  fi
+
+try:
+    rc = query()
+except Exception:
+    rc = 1
+sys.exit(rc)
+PY
+)
+
+# One HTTPS DNS query, or a forwarder that speaks ordinary DNS and asks the
+# resolvers over HTTPS. Port 53 through the proxy can time out while an
+# ordinary page fetch already works. argv is documented on each mode.
+DOH_PY=$(cat <<'PY'
+import select
+import socket
+import ssl
+import struct
+import sys
+import threading
+
+SNI = 'cloudflare-dns.com'
+
+
+def first_a(data):
+    if len(data) < 12 or data[3] & 0x0F:
+        return None
+
+    def skip_name(i):
+        hops = 0
+        while hops < 16:
+            if i >= len(data):
+                raise ValueError('name')
+            n = data[i]
+            if n == 0:
+                return i + 1
+            if n & 0xC0 == 0xC0:
+                if i + 1 >= len(data):
+                    raise ValueError('pointer')
+                return i + 2
+            if n & 0xC0:
+                raise ValueError('label')
+            nxt = i + 1 + n
+            if nxt > len(data):
+                raise ValueError('label')
+            i = nxt
+            hops += 1
+        raise ValueError('loop')
+
+    qdcount, ancount = struct.unpack('!HH', data[4:8])
+    i = 12
+    for _ in range(qdcount):
+        i = skip_name(i)
+        if i + 4 > len(data):
+            return None
+        i += 4
+    for _ in range(ancount):
+        i = skip_name(i)
+        if i + 10 > len(data):
+            return None
+        typ, clas, _ttl, rdlen = struct.unpack('!HHIH', data[i:i + 10])
+        i += 10
+        if i + rdlen > len(data):
+            return None
+        rdata = data[i:i + rdlen]
+        i += rdlen
+        if typ == 1 and clas == 1 and rdlen == 4:
+            return '%d.%d.%d.%d' % (rdata[0], rdata[1], rdata[2], rdata[3])
+    return None
+
+
+def unchunk(body):
+    out = b''
+    while body:
+        line, sep, body = body.partition(b'\r\n')
+        if not sep:
+            break
+        n = int(line.split(b';', 1)[0] or b'0', 16)
+        if n == 0:
+            break
+        out += body[:n]
+        body = body[n:]
+        if body.startswith(b'\r\n'):
+            body = body[2:]
+    return out
+
+
+def header_map(head):
+    headers = {}
+    for line in head.split(b'\r\n')[1:]:
+        if b':' not in line:
+            continue
+        key, value = line.split(b':', 1)
+        headers[key.strip().lower()] = value.strip()
+    return headers
+
+
+def read_http(sock):
+    data = b''
+    while b'\r\n\r\n' not in data:
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 65536:
+            raise ValueError('long http header')
+    head, sep, body = data.partition(b'\r\n\r\n')
+    if not sep:
+        raise ValueError('short http response')
+    status = head.split(b'\r\n', 1)[0].split()
+    if len(status) < 2 or status[1] != b'200':
+        code = status[1].decode('ascii', 'replace') if len(status) > 1 else '?'
+        raise ValueError('http %s' % code)
+    headers = header_map(head)
+    if headers.get(b'transfer-encoding', b'').lower() == b'chunked':
+        while b'\r\n0' not in body and not body.endswith(b'\r\n0\r\n\r\n'):
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            body += chunk
+            if len(body) > 1024 * 1024:
+                raise ValueError('long http response')
+        return unchunk(body)
+    if b'content-length' in headers:
+        n = int(headers[b'content-length'])
+        while len(body) < n:
+            chunk = sock.recv(n - len(body))
+            if not chunk:
+                break
+            body += chunk
+        return body[:n]
+    while True:
+        chunk = sock.recv(8192)
+        if not chunk:
+            break
+        body += chunk
+        if len(body) > 1024 * 1024:
+            raise ValueError('long http response')
+    return body
+
+
+def recvall(conn, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise EOFError
+        buf += chunk
+    return buf
+
+
+def doh_exchange(server, query, timeout, cafile, port):
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(timeout)
+    ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+    tls = ctx.wrap_socket(raw, server_hostname=SNI)
+    try:
+        tls.connect((server, port))
+        head = (
+            'POST /dns-query HTTP/1.1\r\n'
+            'Host: %s\r\n'
+            'Content-Type: application/dns-message\r\n'
+            'Accept: application/dns-message\r\n'
+            'Connection: close\r\n'
+            'Content-Length: %d\r\n\r\n' % (SNI, len(query))
+        ).encode()
+        tls.sendall(head + query)
+        body = read_http(tls)
+    finally:
+        tls.close()
+    if len(body) < 12 or len(body) > 65535:
+        raise ValueError('short dns answer')
+    return body
+
+
+def encode(name):
+    out = b''
+    for part in name.rstrip('.').split('.'):
+        try:
+            raw = part.encode('ascii')
+        except UnicodeEncodeError:
+            return None
+        if not raw or len(raw) > 63:
+            return None
+        out += bytes([len(raw)]) + raw
+    return out + b'\x00'
+
+
+def ask_servers(servers, query, timeout, cafile, port):
+    last = 'no dns answer'
+    for server in servers:
+        if not server:
+            continue
+        try:
+            return doh_exchange(server, query, timeout, cafile, port)
+        except Exception as exc:
+            last = str(exc)
+    raise RuntimeError(last)
+
+
+def cmd_query():
+    if len(sys.argv) not in (5, 6, 7):
+        return 2
+    server, qname = sys.argv[2], sys.argv[3]
+    timeout = float(sys.argv[4])
+    cafile = sys.argv[5] if len(sys.argv) >= 6 and sys.argv[5] else None
+    port = int(sys.argv[6]) if len(sys.argv) == 7 else 443
+    if not (0 < timeout <= 60) or not (0 < port < 65536):
+        return 2
+    qn = encode(qname)
+    if qn is None:
+        return 2
+    query = b'\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00' + qn + b'\x00\x01\x00\x01'
+    body = ask_servers([server], query, timeout, cafile, port)
+    addr = first_a(body)
+    if addr is None:
+        return 1
+    sys.stdout.write(addr + '\n')
+    return 0
+
+
+def drop_priv(name):
+    if not name or name == '-':
+        return
+    import os
+    import pwd
+    pw = pwd.getpwnam(name)
+    os.setgroups([])
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
+
+
+def serve():
+    if len(sys.argv) not in (7, 8, 9):
+        return 2
+    bind, port_s, user, server_s, timeout_s = sys.argv[2:7]
+    cafile = sys.argv[7] if len(sys.argv) >= 8 and sys.argv[7] else None
+    upstream = int(sys.argv[8]) if len(sys.argv) == 9 else 443
+    port = int(port_s)
+    timeout = float(timeout_s)
+    servers = [s for s in server_s.split(',') if s]
+    # Port 0 asks the kernel for an ephemeral port. Callers read it from
+    # the ready line. The upstream port is always explicit.
+    if not servers or not (0 <= port < 65536) or not (0 < upstream < 65536):
+        sys.stderr.write('bad forwarder arguments\n')
+        return 2
+    if timeout <= 0 or timeout > 60:
+        return 2
+
+    def handle(payload):
+        return ask_servers(servers, payload, timeout, cafile, upstream)
+
+    def reply_udp(data, addr):
+        try:
+            if len(data) < 12 or len(data) > 4096:
+                return
+            body = handle(data)
+            udp.sendto(body, addr)
+        except Exception:
+            return
+
+    def reply_tcp(conn):
+        try:
+            conn.settimeout(timeout)
+            while True:
+                ln = struct.unpack('!H', recvall(conn, 2))[0]
+                if ln < 12 or ln > 4096:
+                    break
+                body = handle(recvall(conn, ln))
+                conn.sendall(struct.pack('!H', len(body)) + body)
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp.bind((bind, port))
+    tcp.bind((bind, port))
+    tcp.listen(16)
+    # Bind while still root, then become the tunnel user so upstream queries
+    # use that uid's route into the tun. A mark is applied too late to choose
+    # the source, and this process must not need a second default route.
+    drop_priv(user)
+    udp.setblocking(False)
+    tcp.setblocking(False)
+    sys.stdout.write('ready %d\n' % udp.getsockname()[1])
+    sys.stdout.flush()
+    while True:
+        readable, _, _ = select.select([udp, tcp], [], [], 1.0)
+        for sock in readable:
+            if sock is udp:
+                try:
+                    data, addr = udp.recvfrom(4096)
+                except BlockingIOError:
+                    continue
+                threading.Thread(target=reply_udp, args=(data, addr), daemon=True).start()
+            else:
+                try:
+                    conn, _addr = tcp.accept()
+                except BlockingIOError:
+                    continue
+                threading.Thread(target=reply_tcp, args=(conn,), daemon=True).start()
+
+
+try:
+    mode = sys.argv[1] if len(sys.argv) > 1 else ''
+    if mode == 'doh-query':
+        rc = cmd_query()
+    elif mode == 'doh-serve':
+        rc = serve()
+    else:
+        rc = 2
+except Exception as exc:
+    sys.stderr.write('%s\n' % exc)
+    rc = 1
+sys.exit(rc)
+PY
+)
+
+# HTTPS to one resolver, through the tun. Prints one A record. The uid rule
+# selects the tun before a source address is chosen, so this does not need a
+# main-table default route.
+query_doh() {
+  local server=$1 name=$2 addr
+  addr=$(unshare --mount --propagation private "$SCRIPT" --inside-run \
+    python3 -c "$DOH_PY" doh-query "$server" "$name" "$DNS_QUERY_TIMEOUT") || return 1
+  [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  printf '%s\n' "$addr"
+}
+
+# Ask one resolver for an A record over TCP. Prints the address. A new
+# socket is a new tun2proxy session, so a handshake stuck on an earlier
+# query is not reused. The netshare uid rule sends this through the tun.
+query_resolver() {
+  local server=$1 name=$2 addr
+  addr=$(unshare --mount --propagation private "$SCRIPT" --inside-run \
+    python3 -c "$DNS_A_QUERY" "$server" "$name" "$DNS_QUERY_TIMEOUT") || return 1
+  [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  printf '%s\n' "$addr"
+}
+
+# Sets resolved_addr to one public A record, or returns 1 and sets
+# resolve_detail. The address stays in the caller: printing it would run
+# this function in a subshell and drop resolve_detail. Both resolvers are
+# asked over HTTPS before any TCP port 53 socket is opened. A hung port 53
+# session would otherwise sit ahead of the other resolver's HTTPS query,
+# and that session stays until the data plane exits.
+resolve_through_tun() {
+  local name=$1 server raw addr errfile err mode
+  local -a failed=()
+  local last_err=""
+  resolve_detail=""
+  resolved_addr=""
+  errfile=$(mktemp)
+  for mode in https tcp; do
+    while IFS= read -r server; do
+      [[ -n "$server" ]] || continue
+      : >"$errfile"
+      raw=""
+      if [[ "$mode" == https ]]; then
+        raw=$(query_doh "$server" "$name" 2>"$errfile") || raw=""
+      else
+        raw=$(query_resolver "$server" "$name" 2>"$errfile") || raw=""
+      fi
+      if [[ -n "$raw" ]] && addr=$(printf '%s\n' "$raw" | classify_resolved_address "${BYPASS_CIDR:-0.0.0.0/32}"); then
+        rm -f "$errfile"
+        resolved_addr=$addr
+        return 0
+      fi
+      failed+=("$server")
+      [[ -s "$errfile" ]] || continue
+      err=$(tr '\n' ' ' <"$errfile" | sed 's/[[:space:]]*$//')
+      [[ -n "$err" ]] && last_err=${err:0:160}
+    done < <(runner_servers)
+  done
   rm -f "$errfile"
-  if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+  resolve_detail="no public DNS answer from ${failed[*]}"
+  [[ -n "$last_err" ]] && resolve_detail+=" (${last_err})"
+  return 1
+}
+
+stop_doh_forwarder() {
+  local p _
+  [[ -f "$DOH_PID" ]] || return 0
+  p=$(<"$DOH_PID")
+  rm -f "$DOH_PID"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 0
+  kill "$p" >/dev/null 2>&1 || return 0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$p" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  kill -KILL "$p" >/dev/null 2>&1 || true
+}
+
+# Ordinary DNS on the tun address. The process binds that port as root, then
+# becomes the tunnel user, so each upstream query takes the same route as the
+# transport check.
+start_doh_forwarder() {
+  local p i
+  [[ "$tun_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  if [[ -f "$DOH_PID" ]]; then
+    p=$(<"$DOH_PID")
+    if [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$DOH_PID"
+  fi
+  install -d -m 0755 "$RUN_DIR"
+  : >"${RUN_DIR}/doh.ready"
+  # setsid so this survives up returning. Drop the lock fd so down is not
+  # blocked for the life of the forwarder.
+  setsid python3 -c "$DOH_PY" doh-serve "$tun_ip" 53 "$RUN_USER" \
+    "${DNS_SERVER_1},${DNS_SERVER_2}" "$DNS_QUERY_TIMEOUT" \
+    </dev/null >"${RUN_DIR}/doh.ready" 2>"${RUN_DIR}/doh.log" 9>&- &
+  printf '%s\n' "$!" >"$DOH_PID"
+  for ((i = 0; i < 50; i++)); do
+    if grep -q '^ready' "${RUN_DIR}/doh.ready" 2>/dev/null; then
+      return 0
+    fi
+    p=$(<"$DOH_PID")
+    if ! kill -0 "$p" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+doh_fail_detail() {
+  local line=""
+  [[ -f "${RUN_DIR}/doh.log" ]] || return 0
+  line=$(tail -n 1 "${RUN_DIR}/doh.log" 2>/dev/null || true)
+  line=${line//$'\n'/ }
+  [[ -n "$line" ]] || return 0
+  printf ' (%s)' "${line:0:160}"
+}
+
+point_runner_at_forwarder() {
+  [[ "$tun_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  install -d -m 0755 "$ETC_DIR"
+  {
+    printf 'nameserver %s\n' "$tun_ip"
+    printf '%s\n' "options timeout:${DNS_QUERY_TIMEOUT} attempts:1 use-vc single-request-reopen"
+  } >"${ETC_DIR}/resolv.conf"
+}
+
+# HTTPS to example.com at an address the tunnel already resolved.
+# fetch_code and fetch_err are set. Returns curl's status.
+fetch_resolved_https() {
+  local addr=$1 errfile code err
+  fetch_code=""
+  fetch_err=""
+  errfile=$(mktemp)
+  if code=$(unshare --mount --propagation private "$SCRIPT" --inside-run \
+      curl -4 -sS -o /dev/null -w '%{http_code}' \
+        --resolve "example.com:443:${addr}" \
+        --connect-timeout 8 --max-time 12 \
+        https://example.com 2>"$errfile"); then
+    fetch_code=$code
+    rm -f "$errfile"
     return 0
   fi
-  probe_detail="HTTP ${code:-no status}"
+  err=$(tr '\n' ' ' <"$errfile" | sed 's/[[:space:]]*$//')
+  rm -f "$errfile"
+  fetch_code=$code
+  fetch_err=${err:0:200}
+  return 1
+}
+
+# Gate 1. The netshare user is marked into table 849. Do not call
+# `netshare run` here: this process holds the lock, and run takes it too.
+# Name lookup is separate from curl so the connect timeout cannot cancel
+# the second resolver. Each attempt opens new sockets.
+probe_marked_http() {
+  local attempt
+  probe_detail=""
+  for ((attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++)); do
+    if ! resolve_through_tun example.com; then
+      probe_detail=${resolve_detail:-DNS failed}
+    elif ! fetch_resolved_https "$resolved_addr"; then
+      probe_detail="curl to ${resolved_addr} failed (${fetch_code:-no status})"
+      [[ -n "$fetch_err" ]] && probe_detail+=": ${fetch_err}"
+    elif [[ "$fetch_code" =~ ^[23][0-9][0-9]$ ]]; then
+      probe_detail=""
+      return 0
+    else
+      probe_detail="HTTP ${fetch_code:-no status} from ${resolved_addr}"
+    fi
+    (( attempt < PROBE_ATTEMPTS )) && sleep "$PROBE_PAUSE"
+  done
+  if [[ -n "$probe_detail" ]]; then
+    probe_detail+=" after ${PROBE_ATTEMPTS} attempts"
+  fi
   return 1
 }
 
@@ -1624,34 +2334,94 @@ verify_dns_gate() {
   dns2_re=${DNS_SERVER_2//./\\.}
   local _
   for _ in 1 2 3 4 5 6 7 8; do
-    if grep -E "TCP ${ip_re}:[0-9]+ -> (${dns1_re}|${dns2_re}):853" "$LOG" >/dev/null 2>&1; then
+    if grep -E "TCP ${ip_re}:[0-9]+ -> (${dns1_re}|${dns2_re}):(443|853)" "$LOG" >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.4
   done
-  echo "netshare: tun log has no DNS-over-TLS session to ${DNS_SERVER_1} or ${DNS_SERVER_2} port 853" >&2
+  echo "netshare: tun log has no DNS session to ${DNS_SERVER_1} or ${DNS_SERVER_2} on port 443 or 853" >&2
   tail -n 40 "$LOG" >&2 || true
   return 1
 }
 
+# Gate 1 across data-plane generations. The direct request decides whether
+# another process can help: the phone has to answer it before the first
+# probe and after every failure. A phone that stops answering ends the loop.
+negotiate_transport() {
+  local try
+  negotiate_detail=""
+  if ! proxy_upstream_ok; then
+    negotiate_detail="access point did not answer a direct request"
+    return 1
+  fi
+  for ((try = 1; try <= ENGINE_TRIES; try++)); do
+    if probe_marked_http; then
+      return 0
+    fi
+    negotiate_detail=$probe_detail
+    if ! proxy_upstream_ok; then
+      negotiate_detail="${probe_detail:+$probe_detail; }access point stopped answering direct requests"
+      return 1
+    fi
+    if (( try == ENGINE_TRIES )); then
+      negotiate_detail="${probe_detail:+$probe_detail; }direct request succeeded through ${ENGINE_TRIES} data planes"
+      return 1
+    fi
+    echo "netshare: access point has internet; restarting the data plane (${try}/${ENGINE_TRIES})" >&2
+    if ! restart_dataplane; then
+      negotiate_detail="could not restart the data plane${probe_detail:+ (${probe_detail})}"
+      return 1
+    fi
+  done
+  return 1
+}
+
+# Gate 2, repeated. One resolvectl miss is not enough to remove the tun
+# after the transport check already passed.
+confirm_dns_gate() {
+  local try
+  for ((try = 1; try <= ENGINE_TRIES; try++)); do
+    if verify_dns_gate; then
+      return 0
+    fi
+    if (( try < ENGINE_TRIES )); then
+      sleep "$PROBE_PAUSE"
+    fi
+  done
+  return 1
+}
+
 probe_desktop_http() {
-  local uid=$1 gid home code=""
+  local uid=$1 gid home code="" attempt
+  local -a curl_cmd
   gid=$(id -g "$uid")
   home=$(getent passwd "$uid" | cut -d: -f6)
   [[ -n "$home" ]] || home=/tmp
-  if ! code=$(
-    cd /tmp
-    setpriv --reuid "$uid" --regid "$gid" --clear-groups \
-      --no-new-privs --inh-caps=-all --reset-env \
-      env PATH="/usr/bin:/bin" "HOME=${home}" \
-      curl -4 -sS -o /dev/null -w '%{http_code}' \
-        --connect-timeout 8 --max-time 20 \
-        https://example.com
-  ); then
-    echo "netshare: desktop curl failed (${code:-no status})" >&2
-    return 1
+  # The DNS gate already accepted this address. Putting it on the command
+  # keeps curl's connect timeout from waiting on another lookup.
+  curl_cmd=(
+    curl -4 -sS -o /dev/null -w '%{http_code}'
+    --connect-timeout 8 --max-time 12
+  )
+  if [[ ${RESOLVED_EXAMPLE_IP:-} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    curl_cmd+=(--resolve "example.com:443:${RESOLVED_EXAMPLE_IP}")
   fi
-  [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+  curl_cmd+=(https://example.com)
+  for ((attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++)); do
+    code=""
+    if code=$(
+      cd /tmp
+      setpriv --reuid "$uid" --regid "$gid" --clear-groups \
+        --no-new-privs --inh-caps=-all --reset-env \
+        env PATH="/usr/bin:/bin" "HOME=${home}" \
+        "${curl_cmd[@]}"
+    ) && [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
+      return 0
+    fi
+    (( attempt < PROBE_ATTEMPTS )) && sleep "$PROBE_PAUSE"
+  done
+  echo "netshare: desktop curl failed (${code:-no status})" >&2
+  return 1
 }
 
 verify_desktop_gate() {
@@ -1939,6 +2709,7 @@ cmd_up() {
     die "refusing tun address ${tun_ip}"
   fi
   plane=$(data_plane_proxy "$PROXY_URL") || exit 1
+  engine_plane=$plane
   ensure_user
   ensure_etc
   ensure_dispatcher
@@ -1949,64 +2720,19 @@ cmd_up() {
 
   trap on_up_err ERR
   trap on_up_signal INT TERM
-  # The proxy port has to leave this host before tun2proxy connects, when
-  # the gateway address is local here.
+  # The device stays down and has no address unless --setup is passed.
+  # launch_engine does not pass --setup. The proxy port has to leave this
+  # host before tun2proxy connects, when the gateway address is local here.
   if ! install_gateway_shadow; then
     fail_up "could not reach ${gateway} on ${iface} while that address is local"
   fi
-  local -a args=(
-    --proxy "$plane"
-    --tun "$TUN"
-    --mtu "$TUN_MTU"
-    --dns over-tcp
-    --dns-addr "$DNS_SERVER_1"
-    --bypass "$BYPASS_CIDR"
-    --verbosity info
-    --exit-on-fatal-error
-    --max-sessions "$MAX_SESSIONS"
-  )
-  local arg
-  for arg in "${args[@]}"; do
-    if [[ "$arg" == "--setup" || "$arg" == "--virtual-dns-pool" ]]; then
-      fail_up "refusing to pass ${arg}"
-    fi
-  done
-  # tun2proxy must not inherit the lock fd. An inherited flock stays
-  # held for the life of the process, and later up/down/run block on it.
-  setsid "$TUN2PROXY" "${args[@]}" >>"$LOG" 2>&1 </dev/null 9>&- &
-  pid=$!
-  printf '%s\n' "$pid" >"${RUN_DIR}/pid"
-
-  # The device appears when the process opens it. It stays down and has
-  # no address unless --setup is passed, and --setup is refused above.
-  local ready=0 i
-  for ((i = 0; i < 50; i++)); do
-    if ! pid_alive; then
-      echo "netshare: tun2proxy exited" >&2
-      tail -n 40 "$LOG" >&2 || true
-      fail_up "tun2proxy exited during startup"
-    fi
-    if ip link show "$TUN" >/dev/null 2>&1; then
-      ready=1
-      break
-    fi
-    sleep 0.1
-  done
-  if (( ready == 0 )); then
-    echo "netshare: ${TUN} did not appear" >&2
-    tail -n 40 "$LOG" >&2 || true
-    fail_up "${TUN} did not come up"
+  if ! launch_engine "$plane"; then
+    fail_up "tun2proxy did not stay up"
   fi
-  release_tun_from_nm
-  sysctl -q -w "net.ipv6.conf.${TUN}.disable_ipv6=1" || true
-  ip link set dev "$TUN" mtu "$TUN_MTU" up
   # A /32 is a local address. It does not install a connected subnet.
-  ip addr replace "${tun_ip}/32" dev "$TUN"
-  tun_addr="${tun_ip}/32"
-
-  ip route replace table "$TABLE" "$BYPASS_CIDR" dev "$iface" src "$src"
-  ip route replace table "$TABLE" "${tun_ip}/32" dev "$TUN"
-  ip route replace table "$TABLE" default dev "$TUN" src "$tun_ip"
+  if ! configure_tun_link; then
+    fail_up "could not configure ${TUN}"
+  fi
   ip rule add pref "$RULE_PREF" fwmark "$MARK" lookup "$TABLE"
   if ! install_runner_rule; then
     fail_up "could not install the runner policy rule"
@@ -2031,13 +2757,19 @@ cmd_up() {
   if [[ "$(proxy_route_dev)" != "$iface" ]]; then
     fail_up "gateway ${gateway} is not on ${iface}"
   fi
-  if ! probe_marked_http; then
-    fail_up "transport through the access-point proxy failed${probe_detail:+ (${probe_detail})}"
+  if ! negotiate_transport; then
+    fail_up "transport through the access-point proxy failed${negotiate_detail:+ (${negotiate_detail})}"
   fi
 
   # No account to move. Leave the host resolver alone. `netshare run` uses
-  # the runner rule installed above.
+  # the forwarder on the tun address.
   if (( traffic_uid == 0 )); then
+    if ! start_doh_forwarder; then
+      fail_up "could not start DNS on ${TUN}$(doh_fail_detail)"
+    fi
+    if ! point_runner_at_forwarder; then
+      fail_up "could not point the runner at DNS"
+    fi
     trap - ERR INT TERM
     start_reap
     report_up
@@ -2048,13 +2780,19 @@ cmd_up() {
   if ! install_dns_host_routes; then
     fail_up "could not install DNS host routes"
   fi
+  if ! start_doh_forwarder; then
+    fail_up "could not start DNS on ${TUN}$(doh_fail_detail)"
+  fi
+  if ! point_runner_at_forwarder; then
+    fail_up "could not point the runner at DNS"
+  fi
   if ! record_dns_links; then
     fail_up "could not save the current resolver"
   fi
   if ! apply_tunnel_dns; then
     fail_up "could not point resolved at the tun"
   fi
-  if ! verify_dns_gate; then
+  if ! confirm_dns_gate; then
     fail_up "resolver did not return a public address through the tun; desktop default was not changed"
   fi
   if [[ "$(route_dev "$ROUTE_PROBE")" == "$TUN" ]]; then
@@ -2123,15 +2861,24 @@ cmd_default() {
       if ! install_dns_host_routes; then
         die "could not install DNS host routes"
       fi
+      if ! start_doh_forwarder; then
+        die "could not start DNS on ${TUN}$(doh_fail_detail)"
+      fi
+      if ! point_runner_at_forwarder; then
+        stop_doh_forwarder
+        die "could not point the runner at DNS"
+      fi
       if [[ ! -f "$DNS_LINKS_FILE" ]]; then
         record_dns_links
       fi
       if ! apply_tunnel_dns; then
+        stop_doh_forwarder
+        runner_resolv_text >"${ETC_DIR}/resolv.conf"
         restore_dns
         delete_dns_host_routes
         die "could not point resolved at the tun"
       fi
-      if ! verify_dns_gate; then
+      if ! confirm_dns_gate; then
         restore_dns
         delete_dns_host_routes
         die "resolver did not return a public address through the tun"

@@ -205,7 +205,10 @@ These names are the working defaults. The same conf file can override them. `up`
 | `DNS_SERVER_1` | `1.1.1.1` | IPv4 address | First resolver given to the tun. Cloudflare's primary public resolver. |
 | `DNS_SERVER_2` | `1.0.0.1` | IPv4 address | Second resolver given to the tun. Cloudflare's secondary public resolver. |
 | `RUN_DNS` | `DNS_SERVER_1` | IPv4 address | First resolver for `netshare run`. The next distinct server is tried when this one does not answer within `DNS_QUERY_TIMEOUT` seconds. |
-| `DNS_QUERY_TIMEOUT` | `3` | seconds | How long one DNS query waits before the next resolver is tried. |
+| `DNS_QUERY_TIMEOUT` | `3` | seconds | How long one DNS query waits, over HTTPS or TCP, before the next resolver is tried. |
+| `PROBE_ATTEMPTS` | `3` | positive integer | How many times one data plane repeats the transport check. |
+| `PROBE_PAUSE` | `1` | seconds | Pause between those checks, and between DNS-gate retries. |
+| `ENGINE_TRIES` | `3` | positive integer | How many data planes `up` will start while a direct request to the access point still succeeds, and how many times the DNS check is repeated. |
 | `ROUTE_PROBE` | `9.9.9.9` | IPv4 address other than either DNS server | Address used to ask which device a normal lookup uses. The DNS servers already have host routes into the tun. |
 | `NETSHARE_PREFIX` | `192.168.49.` | IPv4 prefix text | Client addresses must start with this. The tun address is `10.10.` plus the last two octets. |
 | `NETSHARE_GATEWAY` | `192.168.49.1` | IPv4 address | Proxy gateway. It is not mapped to a tun address. |
@@ -230,7 +233,9 @@ The gateway address can already belong to another interface on this machine.
 A connection to that address then stays here, and the phone never sees it.
 While the tunnel is up, TCP to the proxy port is sent out the phone link,
 and replies from that address are accepted. Every other port on the address
-stays on this machine. `down` puts the route back.
+stays on this machine. `down` puts the route back. A host that was already
+learned on a different interface inside that same subnet keeps its own host
+route, so the desktop table does not send it to the phone.
 
 ## Routing
 
@@ -242,9 +247,28 @@ routes. systemd-resolved is not pointed at `198.18.0.1`. TCP and UDP go
 through the SOCKS5 proxy. ICMP does not. `up` keeps NetworkManager off the tun, so its connectivity check is not sent through the phone.
 
 The tun's resolvers are `DNS_SERVER_1` and `DNS_SERVER_2`, Cloudflare's
-`1.1.1.1` and `1.0.0.1`, with opportunistic DNS-over-TLS. `up` installs a
-host route for each into the tun before it installs the account rule.
-`netshare run` queries `DNS_SERVER_1`, then `DNS_SERVER_2` if that server does not answer within 8 seconds. `ROUTE_PROBE` (`9.9.9.9`) is a
+`1.1.1.1` and `1.0.0.1`. Before `up` moves a desktop account, it asks
+those resolvers over HTTPS, through the tun, on a new socket per resolver.
+Both resolvers are asked over HTTPS before any port 53 query is opened.
+Port 53 is used only when neither HTTPS query returned a public address.
+A port 53 session that nobody answers stays open until that data plane
+exits, so it must not run ahead of the other resolver's HTTPS query.
+Each query waits `DNS_QUERY_TIMEOUT` seconds (3), and a query that does
+not answer is followed by the next server on that same path. The check then fetches `https://example.com`
+at the address that came back, and repeats the pair `PROBE_ATTEMPTS`
+times. One stuck handshake does not cancel the other resolver or end the
+check. Desktop lookups go to a forwarder on the tun's own address. The
+forwarder runs as the tunnel user and asks Cloudflare over that same HTTPS
+path, so the lookup does not need a second default route.
+`up` still installs a host route for each Cloudflare address into the tun
+before it installs the account rule. `netshare run` asks the forwarder.
+A stuck session on the
+phone is dropped only when that data plane exits. `up` asks the access
+point directly first. If the phone does not answer, `up` stops. If the
+tun check fails while the direct request still succeeds, `up` starts a
+new data plane and checks again, up to `ENGINE_TRIES` times. The DNS
+check that follows the host routes is repeated the same number of times.
+`ROUTE_PROBE` (`9.9.9.9`) is a
 different public address, used only to see which device a normal lookup
 uses, because the resolver addresses already point at the tun.
 
