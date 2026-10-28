@@ -204,7 +204,8 @@ These names are the working defaults. The same conf file can override them. `up`
 | `VIRTUAL_CIDR` | `198.18.0.0/15` | IPv4 CIDR | tun2proxy's virtual address pool. It is not a resolver. |
 | `DNS_SERVER_1` | `1.1.1.1` | IPv4 address | First resolver given to the tun. Cloudflare's primary public resolver. |
 | `DNS_SERVER_2` | `1.0.0.1` | IPv4 address | Second resolver given to the tun. Cloudflare's secondary public resolver. |
-| `RUN_DNS` | `DNS_SERVER_1` | IPv4 address | First resolver for `netshare run`. `DNS_SERVER_2` is tried if it does not answer within 8 seconds. |
+| `RUN_DNS` | `DNS_SERVER_1` | IPv4 address | First resolver for `netshare run`. The next distinct server is tried when this one does not answer within `DNS_QUERY_TIMEOUT` seconds. |
+| `DNS_QUERY_TIMEOUT` | `3` | seconds | How long one DNS query waits before the next resolver is tried. |
 | `ROUTE_PROBE` | `9.9.9.9` | IPv4 address other than either DNS server | Address used to ask which device a normal lookup uses. The DNS servers already have host routes into the tun. |
 | `NETSHARE_PREFIX` | `192.168.49.` | IPv4 prefix text | Client addresses must start with this. The tun address is `10.10.` plus the last two octets. |
 | `NETSHARE_GATEWAY` | `192.168.49.1` | IPv4 address | Proxy gateway. It is not mapped to a tun address. |

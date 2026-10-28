@@ -90,6 +90,12 @@ VIRTUAL_CIDR="198.18.0.0/15"
 # queries. DNS_SERVER_2 is the fallback. See runner_resolv_text.
 DNS_SERVER_1="1.1.1.1"
 DNS_SERVER_2="1.0.0.1"
+# A UDP/53 packet becomes one tun2proxy DNS-over-TCP session, and that
+# session can sit in the SOCKS handshake until the client gives up. Curl's
+# connect timeout includes the lookup, so that wait also cancelled the
+# second resolver. Each probe query is its own TCP socket, with this budget,
+# and a failed check is repeated.
+DNS_QUERY_TIMEOUT=3
 # Public address used only for route lookups. It must not be either DNS
 # server: those have host routes into the tun before the desktop rule exists.
 ROUTE_PROBE="9.9.9.9"
@@ -465,22 +471,29 @@ ensure_user() {
   fi
 }
 
-# Text of the resolv.conf bind-mounted for `netshare run` and for the
-# transport probe. tun2proxy turns a UDP query into a SOCKS TCP session and
-# logs that session before the handshake finishes. A 2 second resolver
-# timeout expired during that handshake, the probe failed, and `up` removed
-# the tunnel. Eight seconds is the probe's connect timeout. A second server
-# is a different UDP flow, so a handshake stuck on the first server does
-# not consume the retry.
-runner_resolv_text() {
-  printf 'nameserver %s\n' "$RUN_DNS"
+# Resolvers for the runner, RUN_DNS first, without duplicates.
+runner_servers() {
+  printf '%s\n' "$RUN_DNS"
   if [[ "$DNS_SERVER_1" != "$RUN_DNS" ]]; then
-    printf 'nameserver %s\n' "$DNS_SERVER_1"
+    printf '%s\n' "$DNS_SERVER_1"
   fi
   if [[ "$DNS_SERVER_2" != "$RUN_DNS" && "$DNS_SERVER_2" != "$DNS_SERVER_1" ]]; then
-    printf 'nameserver %s\n' "$DNS_SERVER_2"
+    printf '%s\n' "$DNS_SERVER_2"
   fi
-  printf '%s\n' 'options timeout:8 attempts:1 single-request-reopen'
+}
+
+# Text of the resolv.conf bind-mounted for `netshare run`. use-vc forces
+# TCP. tun2proxy proxies that as an ordinary TCP session. A UDP query takes
+# the DNS-over-TCP helper instead, and that helper can sit in the SOCKS
+# handshake until the client gives up. Curl's connect timeout includes DNS,
+# so a hung UDP query also cancelled the second server.
+runner_resolv_text() {
+  local server
+  while IFS= read -r server; do
+    [[ -n "$server" ]] || continue
+    printf 'nameserver %s\n' "$server"
+  done < <(runner_servers)
+  printf '%s\n' "options timeout:${DNS_QUERY_TIMEOUT} attempts:1 use-vc single-request-reopen"
 }
 
 ensure_etc() {
