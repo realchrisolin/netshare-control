@@ -226,6 +226,12 @@ lists every link the probe accepted. A non-empty value is a NetworkManager
 connection-name prefix, so a panel can ignore other networks. `up` still
 considers every connected link.
 
+The gateway address can already belong to another interface on this machine.
+A connection to that address then stays here, and the phone never sees it.
+While the tunnel is up, TCP to the proxy port is sent out the phone link,
+and replies from that address are accepted. Every other port on the address
+stays on this machine. `down` puts the route back.
+
 ## Routing
 
 The selected account's packets use a uid rule into a side table before the

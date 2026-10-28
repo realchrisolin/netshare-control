@@ -74,6 +74,9 @@ BYPASS_CIDR=""
 IFACE=""
 TUN="ns0"
 TABLE="849"
+# TCP to the proxy port only. Used when the gateway address is also local
+# on another interface, so the phone would otherwise never see the connection.
+GATEWAY_TABLE="848"
 MARK="0x849"
 RULE_PREF="5000"
 # uid rule for the netshare runner. Ahead of Tailscale, and distinct from
@@ -150,6 +153,14 @@ state_bypass=""
 state_gateway=""
 desktop_uid=""
 tun_ip=""
+# Set while the proxy port is steered off a local gateway address.
+shadow_active=0
+shadow_accept_prev=""
+shadow_rp_prev=""
+shadow_parked_local=0
+probe_accept_dev=""
+probe_accept_prev=""
+probe_rp_prev=""
 
 die() {
   echo "netshare: $*" >&2
@@ -191,6 +202,10 @@ load_state() {
   state_gateway=""
   desktop_uid=""
   tun_ip=""
+  shadow_active=0
+  shadow_accept_prev=""
+  shadow_rp_prev=""
+  shadow_parked_local=0
   [[ -f "$STATE" ]] || return 1
   local line key value
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -209,6 +224,10 @@ load_state() {
       bypass) state_bypass=$value ;;
       gateway) state_gateway=$value ;;
       desktop_uid) desktop_uid=$value ;;
+      shadow_active) shadow_active=$value ;;
+      shadow_accept_prev) shadow_accept_prev=$value ;;
+      shadow_rp_prev) shadow_rp_prev=$value ;;
+      shadow_parked_local) shadow_parked_local=$value ;;
     esac
   done <"$STATE"
   tun_ip=${tun_addr%%/*}
@@ -234,6 +253,10 @@ write_state() {
     printf 'ssid=%s\n' "$ssid"
     printf 'gateway=%s\n' "$gateway"
     printf 'desktop_uid=%s\n' "$desktop_uid"
+    printf 'shadow_active=%s\n' "$shadow_active"
+    printf 'shadow_accept_prev=%s\n' "$shadow_accept_prev"
+    printf 'shadow_rp_prev=%s\n' "$shadow_rp_prev"
+    printf 'shadow_parked_local=%s\n' "$shadow_parked_local"
   } >"$tmp"
   chmod 0644 "$tmp"
   mv "$tmp" "$STATE"
@@ -403,6 +426,7 @@ teardown() {
   # Resolver first, then the routes that would still steer lookups into the tun.
   # None of this needs the access-point interface to still exist.
   restore_session_proxy
+  remove_gateway_shadow
   restore_dns
   delete_dns_host_routes
   delete_desktop_rules
@@ -601,9 +625,9 @@ on_link_cidr() {
 }
 
 proxy_http_code() {
-  local src_addr=$1 proxy_url=$2 code
+  local src_addr=$1 proxy_url=$2 bind=${3:-$1} code
   if code=$(curl -sS -o /dev/null -w '%{http_code}' \
-      --interface "$src_addr" \
+      --interface "$bind" \
       --proxy "$proxy_url" \
       --connect-timeout 2 --max-time 5 \
       https://example.com 2>/dev/null); then
@@ -622,7 +646,7 @@ scan_access_points() {
   # An optional connection-name prefix skips every other interface before
   # the proxy probe. `up` passes none, so it still considers every link.
   local name_prefix=${1:-}
-  local dev type state cidr local_src gw bypass url code ssid conn want_host line
+  local dev type state cidr local_src gw bypass url code ssid conn want_host line bind holder
   want_host=""
   if [[ -n "$PROXY_URL" ]]; then
     want_host=${PROXY_URL#http://}
@@ -667,7 +691,15 @@ print(next(iface.network.hosts()))' "$cidr" 2>/dev/null || true)
     fi
     ssid=$(link_ssid "$dev" || true)
     ssid=${ssid//$'\t'/ }
-    code=$(proxy_http_code "$local_src" "$url")
+    # The gateway address may be local on another interface. Binding the
+    # probe to this link reaches the phone; the source address does not.
+    bind=$local_src
+    holder=$(gateway_address_iface "$gw")
+    if [[ -n "$holder" && "$holder" != "$dev" ]] && probe_prepare_shadow "$dev"; then
+      bind=$dev
+    fi
+    code=$(proxy_http_code "$local_src" "$url" "$bind")
+    probe_restore_shadow
     if [[ "$code" =~ ^[23][0-9][0-9]$ ]]; then
       line="yes"
     else
@@ -879,6 +911,191 @@ route_dev() {
       for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }
     }'
   fi
+}
+
+iface_holding_address() {
+  local gw=$1
+  awk -v gw="$gw" '$3 == "inet" { split($4, a, "/"); if (a[1] == gw) { print $2; exit } }'
+}
+
+gateway_address_iface() {
+  local gw=$1 lines
+  [[ "$gw" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+  lines=$(ip -o -4 addr show to "${gw}/32" 2>/dev/null || true)
+  [[ -n "$lines" ]] || return 0
+  printf '%s\n' "$lines" | iface_holding_address "$gw"
+}
+
+# The proxy port, not the address. A local gateway address still owns every
+# other port. Optional arg is a uid for the lookup.
+proxy_route_dev() {
+  local uid=${1:-} line=""
+  if [[ -n "$uid" ]]; then
+    line=$(ip -4 route get "$gateway" ipproto tcp dport "$PROXY_PORT" uid "$uid" 2>/dev/null || true)
+  else
+    line=$(ip -4 route get "$gateway" ipproto tcp dport "$PROXY_PORT" 2>/dev/null || true)
+  fi
+  printf '%s\n' "$line" | awk '{
+    for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }
+  }'
+}
+
+shadow_rule_present() {
+  ip rule show pref 0 | grep -q "to ${gateway} ipproto tcp dport ${PROXY_PORT} lookup ${GATEWAY_TABLE}"
+}
+
+restore_shadow_sysctls() {
+  local dev=${1:-$iface}
+  [[ "$dev" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+  if [[ "$shadow_accept_prev" =~ ^[0-9]+$ ]]; then
+    sysctl -q -w "net.ipv4.conf.${dev}.accept_local=${shadow_accept_prev}" || true
+  fi
+  if [[ "$shadow_rp_prev" =~ ^[0-9]+$ ]]; then
+    sysctl -q -w "net.ipv4.conf.${dev}.rp_filter=${shadow_rp_prev}" || true
+  fi
+}
+
+# A new pref 0 rule is stored after the local rule, so it would never run.
+# Park the local rule at pref 1, then the proxy-port rule is the first one.
+rollback_gateway_shadow() {
+  local gw=${gateway:-$NETSHARE_GATEWAY}
+  ip rule del pref 0 to "$gw" ipproto tcp dport "$PROXY_PORT" lookup "$GATEWAY_TABLE" >/dev/null 2>&1 || true
+  if ! ip rule show pref 0 | grep -q 'from all lookup local'; then
+    ip rule add pref 0 from all lookup local >/dev/null 2>&1 || true
+  fi
+  if [[ "$shadow_parked_local" == "1" ]]; then
+    ip rule del pref 1 from all lookup local >/dev/null 2>&1 || true
+  fi
+  ip route flush table "$GATEWAY_TABLE" >/dev/null 2>&1 || true
+  restore_shadow_sysctls
+  shadow_active=0
+  shadow_parked_local=0
+  rm -f "${RUN_DIR}/shadow"
+}
+
+remove_gateway_shadow() {
+  local file="${RUN_DIR}/shadow" line key value dev=""
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" == *=* ]] || continue
+      key=${line%%=*}
+      value=${line#*=}
+      case "$key" in
+        iface) dev=$value ;;
+        gateway) gateway=${gateway:-$value} ;;
+        accept_prev) shadow_accept_prev=$value ;;
+        rp_prev) shadow_rp_prev=$value ;;
+        parked_local) shadow_parked_local=$value ;;
+      esac
+    done <"$file"
+    [[ -n "$dev" ]] && iface=$dev
+    shadow_active=1
+  fi
+  [[ "$shadow_active" == "1" ]] || return 0
+  [[ -n "$gateway" ]] || gateway=${state_gateway:-$NETSHARE_GATEWAY}
+  rollback_gateway_shadow
+}
+
+install_gateway_shadow() {
+  local holder prev_accept prev_rp
+  shadow_active=0
+  shadow_parked_local=0
+  holder=$(gateway_address_iface "$gateway")
+  [[ -n "$holder" && "$holder" != "$iface" ]] || return 0
+  [[ "$iface" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ "$gateway" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  [[ "$src" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || return 1
+
+  prev_accept=$(sysctl -n "net.ipv4.conf.${iface}.accept_local" 2>/dev/null) || return 1
+  prev_rp=$(sysctl -n "net.ipv4.conf.${iface}.rp_filter" 2>/dev/null) || return 1
+  sysctl -q -w "net.ipv4.conf.${iface}.accept_local=1" || return 1
+  if ! sysctl -q -w "net.ipv4.conf.${iface}.rp_filter=2"; then
+    sysctl -q -w "net.ipv4.conf.${iface}.accept_local=${prev_accept}" || true
+    return 1
+  fi
+  shadow_accept_prev=$prev_accept
+  shadow_rp_prev=$prev_rp
+
+  if ! ip route replace table "$GATEWAY_TABLE" "${gateway}/32" dev "$iface" src "$src"; then
+    rollback_gateway_shadow
+    return 1
+  fi
+  if ! ip rule show pref 1 | grep -q 'from all lookup local'; then
+    if ! ip rule add pref 1 from all lookup local; then
+      rollback_gateway_shadow
+      return 1
+    fi
+  fi
+  shadow_parked_local=1
+  if ! shadow_rule_present; then
+    if ! ip rule add pref 0 to "$gateway" ipproto tcp dport "$PROXY_PORT" lookup "$GATEWAY_TABLE"; then
+      rollback_gateway_shadow
+      return 1
+    fi
+  fi
+  if ip rule show pref 0 | grep -q 'from all lookup local'; then
+    if ! ip rule del pref 0 from all lookup local; then
+      rollback_gateway_shadow
+      return 1
+    fi
+  fi
+  if [[ "$(proxy_route_dev)" != "$iface" || "$(route_dev "$gateway")" != "lo" ]]; then
+    rollback_gateway_shadow
+    return 1
+  fi
+  shadow_active=1
+  install -d -m 0755 "$RUN_DIR"
+  cat >"${RUN_DIR}/shadow" <<EOF
+iface=${iface}
+gateway=${gateway}
+accept_prev=${shadow_accept_prev}
+rp_prev=${shadow_rp_prev}
+parked_local=${shadow_parked_local}
+EOF
+  chmod 0644 "${RUN_DIR}/shadow"
+}
+
+# The discovery probe is short. It puts accept_local back before it returns,
+# including when status is not root and the sysctl is refused.
+probe_prepare_shadow() {
+  local dev=$1
+  probe_accept_dev=""
+  [[ "$dev" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  probe_accept_prev=$(sysctl -n "net.ipv4.conf.${dev}.accept_local" 2>/dev/null) || return 1
+  probe_rp_prev=$(sysctl -n "net.ipv4.conf.${dev}.rp_filter" 2>/dev/null) || return 1
+  sysctl -q -w "net.ipv4.conf.${dev}.accept_local=1" >/dev/null 2>&1 || return 1
+  if ! sysctl -q -w "net.ipv4.conf.${dev}.rp_filter=2" >/dev/null 2>&1; then
+    sysctl -q -w "net.ipv4.conf.${dev}.accept_local=${probe_accept_prev}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  probe_accept_dev=$dev
+}
+
+probe_restore_shadow() {
+  local dev=$probe_accept_dev
+  [[ -n "$dev" ]] || return 0
+  sysctl -q -w "net.ipv4.conf.${dev}.accept_local=${probe_accept_prev}" >/dev/null 2>&1 || true
+  sysctl -q -w "net.ipv4.conf.${dev}.rp_filter=${probe_rp_prev}" >/dev/null 2>&1 || true
+  probe_accept_dev=""
+}
+
+# True when a neighbor inside the phone subnet was learned on another device.
+# The desktop table would otherwise send it out the phone link.
+keep_foreign_bypass_host() {
+  local ipaddr=$1 dev=$2 nud=$3 ap=$4 tun=$5 bypass=$6
+  [[ "$ipaddr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  [[ "$dev" =~ ^[A-Za-z0-9._-]+$ && "$dev" != "$ap" && "$dev" != "$tun" ]] || return 1
+  case "$nud" in
+    REACHABLE|STALE|DELAY|PROBE|PERMANENT) ;;
+    *) return 1 ;;
+  esac
+  python3 -c '
+import ipaddress, sys
+host = ipaddress.ip_address(sys.argv[1])
+net = ipaddress.ip_network(sys.argv[2], strict=False)
+sys.exit(0 if host in net and host != net.network_address and host != net.broadcast_address else 1)
+' "$ipaddr" "$bypass"
 }
 
 dns_status_words() {
@@ -1444,7 +1661,7 @@ verify_desktop_gate() {
     echo "netshare: desktop route to ${ROUTE_PROBE} is ${dev:-missing}" >&2
     return 1
   fi
-  dev=$(route_dev "$gateway" "$desktop_uid")
+  dev=$(proxy_route_dev "$desktop_uid")
   if [[ "$dev" != "$iface" ]]; then
     echo "netshare: desktop route to ${gateway} is ${dev:-missing}" >&2
     return 1
@@ -1732,6 +1949,11 @@ cmd_up() {
 
   trap on_up_err ERR
   trap on_up_signal INT TERM
+  # The proxy port has to leave this host before tun2proxy connects, when
+  # the gateway address is local here.
+  if ! install_gateway_shadow; then
+    fail_up "could not reach ${gateway} on ${iface} while that address is local"
+  fi
   local -a args=(
     --proxy "$plane"
     --tun "$TUN"
@@ -1806,7 +2028,7 @@ cmd_up() {
   write_state
 
   # Gate 1. The built-in default and systemd-resolved are still untouched.
-  if [[ "$(route_dev "$gateway")" != "$iface" ]]; then
+  if [[ "$(proxy_route_dev)" != "$iface" ]]; then
     fail_up "gateway ${gateway} is not on ${iface}"
   fi
   if ! probe_marked_http; then
@@ -1838,7 +2060,7 @@ cmd_up() {
   if [[ "$(route_dev "$ROUTE_PROBE")" == "$TUN" ]]; then
     fail_up "${ROUTE_PROBE} already uses ${TUN} before the desktop rule"
   fi
-  if [[ "$(route_dev "$gateway")" != "$iface" ]]; then
+  if [[ "$(proxy_route_dev)" != "$iface" ]]; then
     fail_up "gateway ${gateway} left ${iface} during DNS setup"
   fi
 
