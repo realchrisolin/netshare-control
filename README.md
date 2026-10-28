@@ -46,9 +46,10 @@ Required:
 - `nft` from nftables
 - `flock` and `setpriv` from util-linux
 
-The desktop password dialog, including the bar switch, needs `pinentry-qt`
-or `pinentry-gnome3` from the `pinentry` package. `SUDO_ASKPASS` can name
-another helper. A terminal prompt does not need pinentry.
+A password, when one is still required, is read by sudo. In a terminal it
+asks there. With no terminal it opens a floating terminal. [Passwordless
+sudo](#passwordless-sudo) is the optional local install that lets the bar
+switch skip that prompt.
 
 The scripts also use coreutils, `grep`, `sed`, `awk`, and `cmp`.
 
@@ -84,6 +85,9 @@ cd netshare-control
 ln -s "$PWD/netshare" ~/.local/bin/netshare
 ```
 
+That symlink runs this checkout. The passwordless install below replaces it
+with a symlink to the root-owned `/usr/bin/netshare`.
+
 Overrides are optional. `/etc/netshare.conf` must be owned by root. Copy the
 example and keep the real file out of git:
 
@@ -111,6 +115,88 @@ ln -s "$PWD/bar/netshare.js" ~/.config/omarchy/bar/modules/netshare.js
 
 Restart the shell after the module is in place. Refreshing the shell rewrites
 the rest of the user config, so leave that command alone.
+
+## Passwordless sudo
+
+The checkout on `PATH` is enough to run the controller, and sudo asks for a
+password when a command needs root. The bar switch has no terminal to type
+into. Installing the files below lets members of `wheel` run the tunnel
+commands with no password.
+
+These files stay on the machine that ran the installer, including across a
+reboot. Omarchy does not ship them. A git pull does not refresh them, and
+installing the machine again does not bring them back. Run the installer
+again from the checkout after a pull or a reinstall.
+
+From the checkout, in a terminal, as an account in `wheel`:
+
+```bash
+sudo ./install.sh
+```
+
+The script leaves the tunnel down. It asks for the administrator password.
+The drop-in covers the tunnel commands and leaves this script out, so
+reinstalling asks again. `visudo` checks the drop-in before it is written.
+The script stops if `/usr/bin/netshare` already exists and is some other
+program.
+
+| Path | Mode | What it is |
+| --- | --- | --- |
+| `/usr/bin/netshare` | `0755` | Wrapper. As root it sets `PATH` to the system directories, then runs the copy below. |
+| `/usr/lib/netshare/netshare` | `0755` | The command, copied from the checkout. |
+| `/usr/lib/netshare/lib/tunnel.sh` | `0644` | Tunnel code the command sources. |
+| `/usr/lib/netshare/lib/bar.sh` | `0644` | Panel readout the command sources. |
+| `/etc/sudoers.d/netshare` | `0440` | The rule. |
+
+When `~/.local/bin` exists, the script points `~/.local/bin/netshare` at
+`/usr/bin/netshare` and gives that symlink to the account that ran sudo.
+sudo looks commands up on its own `secure_path`. That path lists `/usr/bin`
+and the other system directories, so the rule names `/usr/bin/netshare`.
+
+`wheel` is the group the other Omarchy one-command grants use. The account
+that uses the bar switch needs to be in it. The rule is:
+
+```
+%wheel ALL=(root) NOPASSWD: /usr/bin/netshare up, /usr/bin/netshare down, /usr/bin/netshare toggle, /usr/bin/netshare default on, /usr/bin/netshare default off, /usr/bin/netshare run *
+```
+
+sudoers matches those arguments exactly. `run` keeps a wildcard because the
+program after it changes. The command drops to the `netshare` system user
+before it runs that program. `up` with an extra argument, and `run` with no
+program, still ask for a password. So do `status`, `bar`, `help`,
+`dns-reassert`, `transport-down`, `reap`, and `--inside-run`. NetworkManager
+already runs `dns-reassert` and `transport-down` as root.
+
+In a terminal, sudo asks on that terminal. The prompt is `Password required
+for netshare: `. With no terminal, the command opens a floating window
+(`xdg-terminal-exec --app-id=TUI.float --title=netshare`), prints one line
+about which tunnel action needs the password, and sudo asks in that window.
+A cached sudo ticket skips the prompt for a command the drop-in does not
+cover.
+
+Check the grant without starting the tunnel:
+
+```bash
+sudo -n -l -l /usr/bin/netshare up
+```
+
+A working grant names `Sudoers entry: /etc/sudoers.d/netshare`, runs as
+root, and shows `!authenticate`. The same listing for `help` names
+`Sudoers entry: /etc/sudoers` and the command `ALL`.
+
+After editing the checkout, run `install.sh` again. Until then,
+`netshare` on `PATH` is the copy under `/usr/lib/netshare`.
+
+To take the local grant off and use the checkout again, run the last line
+from the checkout:
+
+```bash
+sudo rm -f /etc/sudoers.d/netshare /usr/bin/netshare
+sudo rm -rf /usr/lib/netshare
+ln -sfn "$PWD/netshare" ~/.local/bin/netshare
+```
+
+The system user and `/etc/netshare.conf` stay.
 
 ## How to use
 
@@ -141,11 +227,11 @@ before it moves a desktop account, drop to this user so those commands use
 the tun. tun2proxy keeps running as root. Set `RUN_USER` in the root-owned
 conf before the first `up` to choose another name.
 
-A cached sudo ticket is reused. From a terminal, sudo asks on that terminal.
-With no terminal, sudo opens a desktop password dialog (`pinentry-qt`, or
-`pinentry-gnome3`). `SUDO_ASKPASS` overrides that helper. The bar sets
-`NETSHARE_PROMPT=desktop` so the switch uses the dialog even when the session
-still has a terminal. `NETSHARE_PROMPT=terminal` forces the terminal prompt.
+[Passwordless sudo](#passwordless-sudo) is the optional local install that
+lets `wheel` run `up`, `down`, `toggle`, `default on`, `default off`, and
+`run` on `/usr/bin/netshare` with no password. Until that install, sudo
+asks: on the terminal when there is one, and in a floating terminal when
+there is not. A cached ticket skips the prompt.
 
 `sudo netshare up` from an account sends that account through the tun after
 a lookup through the tun returns a public address. The resolvers on that
@@ -183,11 +269,8 @@ discover.
 | `CONNECTION_PREFIX` | empty | start of a connection name, or empty | Used only by `bar`. Empty lists every link the probe accepted. |
 | `NETSHARE_UID` | empty | numeric uid other than `0`, or empty | Account whose traffic follows the tun. Overrides `SUDO_UID`. Empty, with no sudo user, leaves side posture for `netshare run`. |
 | `TUN2PROXY` | `/usr/local/bin/tun2proxy` | path of an executable | The data-plane binary. The environment supplies this default before the conf file is read. |
-| `NETSHARE_PROMPT` | unset | `desktop`, `terminal`, or unset | Unset uses a terminal when there is one, and the desktop dialog otherwise. `desktop` forces the dialog. `terminal` forces the terminal. |
-| `SUDO_ASKPASS` | unset | path of an executable, or unset | Desktop password program. Unset uses `lib/askpass.sh`. |
-| `NETSHARE_PINENTRY` | unset | path of an executable, or unset | pinentry program for `lib/askpass.sh`. Unset tries `pinentry-qt`, then `pinentry-gnome3`. |
 
-`sudo` sets `SUDO_UID` to the account that invoked it. A value of `0` is ignored. The password dialog text is `Password required for netshare: `.
+`sudo` sets `SUDO_UID` to the account that invoked it. A value of `0` is ignored. The sudo prompt is `Password required for netshare: `.
 
 These names are the working defaults. The same conf file can override them. `up` rejects a mark that overlaps `0xff0000`, a rule priority that is not ahead of Tailscale's `5210`, a runner priority that is outside that gap, and a desktop priority that is not between Tailscale's lookup rule at `5270` and the main rule at `32766`.
 
@@ -244,7 +327,7 @@ kernel picks a source address. `RUN_USER` has a separate uid rule, used by
 `netshare run` and by the check `up` makes before that account is moved. A
 mark set in a later netfilter hook is not enough for that. The main-table default stays in place. There are no `/1`
 routes. systemd-resolved is not pointed at `198.18.0.1`. TCP and UDP go
-through the SOCKS5 proxy. ICMP does not. `up` keeps NetworkManager off the tun, so its connectivity check is not sent through the phone.
+through the SOCKS5 proxy. ICMP does not.
 
 The tun's resolvers are `DNS_SERVER_1` and `DNS_SERVER_2`, Cloudflare's
 `1.1.1.1` and `1.0.0.1`. Before `up` moves a desktop account, it asks
@@ -262,7 +345,8 @@ forwarder runs as the tunnel user and asks Cloudflare over that same HTTPS
 path, so the lookup does not need a second default route.
 `up` still installs a host route for each Cloudflare address into the tun
 before it installs the account rule. `netshare run` asks the forwarder.
-A stuck session on the
+`up` also keeps NetworkManager off the tun, so NetworkManager's own
+connectivity check is not sent through the phone. A stuck session on the
 phone is dropped only when that data plane exits. `up` asks the access
 point directly first. If the phone does not answer, `up` stops. If the
 tun check fails while the direct request still succeeds, `up` starts a

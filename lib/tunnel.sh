@@ -201,8 +201,8 @@ its gateway proxy, not by SSID. sudo, or NETSHARE_UID in the root-owned
 conf, selects the account whose traffic then uses the tun. With neither,
 the tun stays up for `netshare run` and the host resolver is left as it was.
 A cached sudo ticket is reused. A terminal asks for the password there.
-With no terminal, sudo opens a desktop password dialog. `bar` does not
-change routes. It is the readout for an optional panel.
+With no terminal, a floating terminal asks. `bar` does not change routes.
+It is the readout for an optional panel.
 EOF
 }
 
@@ -303,17 +303,12 @@ pid_alive() {
   [[ "$err" == *"not permitted"* ]]
 }
 
-# A cached sudo ticket is reused. Otherwise a terminal asks on that terminal.
-# NETSHARE_PROMPT=desktop, and any caller with no terminal, asks through a
-# desktop dialog. sudo -A refreshes the same ticket, so the next call within
-# the timestamp window does not ask again. sudo -n is only the cached path:
-# it never prompts, and a missing ticket used to fail the bar switch.
+# The passwordless grant names this path. Re-exec it rather than whichever
+# copy was invoked, so a checkout is not what sudo runs.
+PACKAGED_PATH=/usr/bin/netshare
+# A cached sudo ticket is reused. A terminal asks on that terminal. With no
+# terminal, a floating terminal asks. sudo -n never prompts.
 SUDO_PROMPT='Password required for netshare: '
-ASKPASS_HELPER=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/askpass.sh
-PINENTRY_CANDIDATES=(
-  pinentry-qt
-  pinentry-gnome3
-)
 
 exec_sudo() {
   exec "$@"
@@ -321,6 +316,36 @@ exec_sudo() {
 
 sudo_cached() {
   sudo -n true >/dev/null 2>&1
+}
+
+# True when sudo would run this exact command without a password. `sudo -l`
+# on its own reports whether a command is permitted, which a wheel member's
+# blanket rule answers yes to. The long listing prints the matched tags.
+# !authenticate is the NOPASSWD tag. Listing runs nothing.
+sudo_grants_passwordless() {
+  local listing
+  listing=$(sudo -n -l -l "$PACKAGED_PATH" "$@" 2>/dev/null) || return 1
+  [[ "$listing" == *'!authenticate'* ]]
+}
+
+sudo_reason() {
+  case "${1:-}" in
+    up) printf '%s\n' "netshare needs an administrator password to start the tunnel." ;;
+    down) printf '%s\n' "netshare needs an administrator password to stop the tunnel." ;;
+    toggle) printf '%s\n' "netshare needs an administrator password to change the tunnel." ;;
+    default) printf '%s\n' "netshare needs an administrator password to change which account uses the tunnel." ;;
+    run) printf '%s\n' "netshare needs an administrator password to run a command through the tunnel." ;;
+    *) printf '%s\n' "netshare needs an administrator password for this tunnel command." ;;
+  esac
+}
+
+# TUI.float is already a floating window class. The terminal waits until sudo
+# finishes, and its exit status is sudo's.
+launch_sudo_terminal() {
+  command -v xdg-terminal-exec >/dev/null 2>&1 || return 1
+  xdg-terminal-exec --app-id=TUI.float --title=netshare -e bash -c \
+    'printf "%s\n\n" "$1"; shift; prompt=$1; shift; exec sudo -p "$prompt" "$@"' \
+    bash "$@"
 }
 
 have_controlling_tty() {
@@ -332,72 +357,25 @@ have_controlling_tty() {
   return 1
 }
 
-pinentry_program() {
-  local name candidate
-  if [[ -n "${NETSHARE_PINENTRY:-}" && -x "$NETSHARE_PINENTRY" ]]; then
-    printf '%s\n' "$NETSHARE_PINENTRY"
-    return 0
-  fi
-  for name in "${PINENTRY_CANDIDATES[@]}"; do
-    if [[ "$name" == /* ]]; then
-      candidate=$name
-    else
-      candidate=$(command -v "$name" 2>/dev/null || true)
-    fi
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
-askpass_program() {
-  if [[ -n "${SUDO_ASKPASS:-}" && -x "$SUDO_ASKPASS" ]]; then
-    printf '%s\n' "$SUDO_ASKPASS"
-    return 0
-  fi
-  if [[ -x "$ASKPASS_HELPER" ]] && pinentry_program >/dev/null; then
-    printf '%s\n' "$ASKPASS_HELPER"
-    return 0
-  fi
-  return 1
-}
-
 elevate_mode() {
-  local mode_prompt=${NETSHARE_PROMPT:-}
   if [[ "$(id -u)" -eq 0 ]]; then
     printf '%s\n' root
+    return 0
+  fi
+  if sudo_grants_passwordless "$@"; then
+    printf '%s\n' passwordless
     return 0
   fi
   if sudo_cached; then
     printf '%s\n' cached
     return 0
   fi
-  case "$mode_prompt" in
-    desktop)
-      if askpass_program >/dev/null; then
-        printf '%s\n' askpass
-        return 0
-      fi
-      printf '%s\n' none
-      return 1
-      ;;
-    terminal)
-      if have_controlling_tty; then
-        printf '%s\n' terminal
-        return 0
-      fi
-      printf '%s\n' none
-      return 1
-      ;;
-  esac
   if have_controlling_tty; then
     printf '%s\n' terminal
     return 0
   fi
-  if askpass_program >/dev/null; then
-    printf '%s\n' askpass
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    printf '%s\n' float
     return 0
   fi
   printf '%s\n' none
@@ -405,25 +383,25 @@ elevate_mode() {
 }
 
 require_root() {
-  local mode helper
+  local mode msg
   if [[ "$(id -u)" -eq 0 ]]; then
     return 0
   fi
   command -v sudo >/dev/null 2>&1 || die "sudo is required"
-  mode=$(elevate_mode) || true
+  mode=$(elevate_mode "$@") || true
   case "$mode" in
-    cached)
-      exec_sudo sudo -n "$SCRIPT" "$@"
+    passwordless|cached)
+      exec_sudo sudo -n "$PACKAGED_PATH" "$@"
       ;;
     terminal)
-      exec_sudo sudo -p "$SUDO_PROMPT" "$SCRIPT" "$@"
+      exec_sudo sudo -p "$SUDO_PROMPT" "$PACKAGED_PATH" "$@"
       ;;
-    askpass)
-      helper=$(askpass_program) || die "a sudo password is required and no desktop prompt is available"
-      SUDO_ASKPASS=$helper exec_sudo sudo -A -p "$SUDO_PROMPT" "$SCRIPT" "$@"
+    float)
+      msg=$(sudo_reason "$1")
+      exec_sudo launch_sudo_terminal "$msg" "$SUDO_PROMPT" "$PACKAGED_PATH" "$@"
       ;;
     *)
-      die "a sudo password is required and there is no terminal or desktop prompt"
+      die "a sudo password is required and no terminal is available"
       ;;
   esac
 }

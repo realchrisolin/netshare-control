@@ -17,7 +17,7 @@ design notes into this repo.
 - Posture values are `desktop` and `side`.
 - A bar-module edit needs `omarchy restart shell`, and only when the user asks. Do not edit `/usr/share/omarchy`. Do not `omarchy refresh shell`.
 - Do not click the bar switch or inject pointer events. Do not run `up` or `down` unless the user asks.
-- Do not elevate with `sudo -n` when a password is required. A cached ticket may skip the prompt. A terminal prompts on the terminal. No terminal, and the bar (`NETSHARE_PROMPT=desktop`), uses the desktop askpass helper. Do not add a NOPASSWD rule for netshare.
+- Do not elevate with `sudo -n` when a password is required. A cached ticket may skip the prompt. A terminal prompts on the terminal. With no terminal, open a floating terminal and let sudo ask there. Do not use `SUDO_ASKPASS`. The passwordless grant is `sudoers.d/netshare`: `%wheel` and the spelled-out tunnel commands on `/usr/bin/netshare`. Do not point that grant at a checkout, and do not add a separate netshare group.
 - Do not change git config.
 
 ## Checks

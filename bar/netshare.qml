@@ -9,8 +9,8 @@ import "netshare.js" as Panel
 // Bar icon and panel for the netshare controller. The panel follows the
 // network panel: a hero with the switch on the right, then the adapter
 // list. Left click opens it. The switch runs `netshare up` or `netshare down`
-// with NETSHARE_PROMPT=desktop, so a missing sudo ticket opens a desktop
-// password dialog. The command matches the position the switch is showing,
+// A missing sudo ticket opens a floating terminal. The command matches
+// the position the switch is showing,
 // so a stale off position cannot stop a tunnel the controller still has up.
 // Names and addresses come from the live lookup.
 Item {
@@ -178,7 +178,7 @@ Item {
     root.toggleError = ""
     root.toggleStderr = ""
     root.pendingUp = !root.tunnelUp
-    toggleProc.command = ["bash", "-lc", root.pendingUp ? "NETSHARE_PROMPT=desktop netshare up" : "NETSHARE_PROMPT=desktop netshare down"]
+    toggleProc.command = ["bash", "-lc", root.pendingUp ? "netshare up" : "netshare down"]
     toggleProc.running = true
   }
 
@@ -213,7 +213,7 @@ Item {
 
   Process {
     id: toggleProc
-    command: ["bash", "-lc", "NETSHARE_PROMPT=desktop netshare toggle"]
+    command: ["bash", "-lc", "netshare toggle"]
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.toggleStderr = text

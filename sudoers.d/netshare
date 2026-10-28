@@ -1,0 +1,9 @@
+# The bar has no terminal to type a password into. These commands create the
+# tun, move an account onto it, run a program through it, or tear it down.
+# Arguments are spelled out. A bare path would allow every subcommand, and
+# sudoers matches the arguments exactly. `run` keeps a wildcard because the
+# program that follows it changes; the controller drops to the tunnel user
+# before executing that program. Dispatcher helpers are not listed.
+# NetworkManager already runs those as root. The path is the root-owned
+# packaged command, not a checkout.
+%wheel ALL=(root) NOPASSWD: /usr/bin/netshare up, /usr/bin/netshare down, /usr/bin/netshare toggle, /usr/bin/netshare default on, /usr/bin/netshare default off, /usr/bin/netshare run *

@@ -6,71 +6,75 @@ source_lib
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+sudo_grants_passwordless() { return 1; }
 sudo_cached() { return 1; }
 have_controlling_tty() { return 1; }
-pinentry_program() { return 1; }
+command() {
+  if [[ "$1" == "-v" && "$2" == "xdg-terminal-exec" ]]; then
+    return 1
+  fi
+  builtin command "$@"
+}
 
-mode=$(elevate_mode) || true
+mode=$(elevate_mode up) || true
 [[ "$mode" == "none" ]] || fail "no prompt mode: $mode"
 
 out=$(expect_fail "no prompt" require_root up)
-[[ "$out" == *"no terminal or desktop prompt"* ]] || fail "no prompt message: $out"
+[[ "$out" == *"no terminal is available"* ]] || fail "no prompt message: $out"
+
+unset -f command
+mode=$(elevate_mode up) || true
+[[ "$mode" == "float" ]] || fail "float mode: $mode"
 
 have_controlling_tty() { return 0; }
-mode=$(elevate_mode) || true
+mode=$(elevate_mode up) || true
 [[ "$mode" == "terminal" ]] || fail "terminal mode: $mode"
 
-NETSHARE_PROMPT=desktop
-mode=$(elevate_mode) || true
-[[ "$mode" == "none" ]] || fail "desktop without helper: $mode"
-
-helper=$tmp/askpass
-printf '#!/bin/sh\nexit 0\n' >"$helper"
-chmod 755 "$helper"
-SUDO_ASKPASS=$helper
-mode=$(elevate_mode) || true
-[[ "$mode" == "askpass" ]] || fail "desktop askpass mode: $mode"
-got=$(askpass_program) || fail "askpass program"
-[[ "$got" == "$helper" ]] || fail "sudo askpass helper"
-
-unset SUDO_ASKPASS
-pinentry_program() { printf '%s\n' "$helper"; }
-mode=$(elevate_mode) || true
-[[ "$mode" == "askpass" ]] || fail "bundled askpass mode: $mode"
-got=$(askpass_program) || fail "bundled askpass program"
-[[ "$got" == "$ASKPASS_HELPER" ]] || fail "bundled helper was not selected"
-
-sudo_cached() { return 0; }
-NETSHARE_PROMPT=desktop
-have_controlling_tty() { return 0; }
-mode=$(elevate_mode) || true
-[[ "$mode" == "cached" ]] || fail "cached skips prompt: $mode"
-
-out=$(
-  exec_sudo() { printf 'ASKPASS=%s CMD=%s\n' "${SUDO_ASKPASS-<unset>}" "$*"; }
-  sudo_cached() { return 0; }
-  require_root up
-)
-[[ "$out" == ASKPASS=\<unset\>\ CMD=sudo\ -n\ *\ up ]] || fail "cached exec: $out"
+sudo_grants_passwordless() { return 0; }
+have_controlling_tty() { return 1; }
+mode=$(elevate_mode up) || true
+[[ "$mode" == "passwordless" ]] || fail "passwordless mode: $mode"
 
 out=$(
   exec_sudo() { printf 'CMD=%s\n' "$*"; }
-  sudo_cached() { return 1; }
-  have_controlling_tty() { return 0; }
-  unset NETSHARE_PROMPT
-  require_root down
-)
-[[ "$out" == CMD=sudo\ -p\ Password\ required\ for\ netshare:\ *\ down ]] || fail "terminal exec: $out"
-
-out=$(
-  exec_sudo() { printf 'ASKPASS=%s CMD=%s\n' "${SUDO_ASKPASS-<unset>}" "$*"; }
-  sudo_cached() { return 1; }
-  have_controlling_tty() { return 0; }
-  NETSHARE_PROMPT=desktop
-  SUDO_ASKPASS=$helper
+  sudo_grants_passwordless() { return 0; }
   require_root up
 )
-[[ "$out" == "ASKPASS=$helper CMD=sudo -A -p Password required for netshare: "*" up" ]] || fail "askpass exec: $out"
+[[ "$out" == "CMD=sudo -n ${PACKAGED_PATH} up" ]] || fail "passwordless exec: $out"
+
+sudo_grants_passwordless() { return 1; }
+sudo_cached() { return 0; }
+mode=$(elevate_mode up) || true
+[[ "$mode" == "cached" ]] || fail "cached skips prompt: $mode"
+
+out=$(
+  exec_sudo() { printf 'CMD=%s\n' "$*"; }
+  sudo_grants_passwordless() { return 1; }
+  sudo_cached() { return 0; }
+  require_root up
+)
+[[ "$out" == "CMD=sudo -n ${PACKAGED_PATH} up" ]] || fail "cached exec: $out"
+
+out=$(
+  exec_sudo() { printf 'CMD=%s\n' "$*"; }
+  sudo_grants_passwordless() { return 1; }
+  sudo_cached() { return 1; }
+  have_controlling_tty() { return 0; }
+  require_root down
+)
+[[ "$out" == "CMD=sudo -p Password required for netshare:  ${PACKAGED_PATH} down" ]] \
+  || fail "terminal exec: $out"
+
+out=$(
+  exec_sudo() { printf 'CMD=%s\n' "$*"; }
+  sudo_grants_passwordless() { return 1; }
+  sudo_cached() { return 1; }
+  have_controlling_tty() { return 1; }
+  require_root up
+)
+[[ "$out" == "CMD=launch_sudo_terminal netshare needs an administrator password to start the tunnel. Password required for netshare:  ${PACKAGED_PATH} up" ]] \
+  || fail "float exec: $out"
+[[ "$out" == *"SUDO_ASKPASS"* || "$out" == *"sudo -A"* ]] && fail "float used askpass: $out"
 
 id() { printf '%s\n' 0; }
 mode=$(elevate_mode) || true
@@ -91,7 +95,7 @@ cat >"$desc"
 printf '%s\n' 'D fixture%20pin' 'OK'
 EOF
 chmod 755 "$pinentry"
-got=$(NETSHARE_PINENTRY=$pinentry "$ASKPASS_HELPER" "Password required for netshare:") || fail "askpass helper failed"
+got=$(NETSHARE_PINENTRY=$pinentry "$ROOT/lib/askpass.sh" "Password required for netshare:") || fail "askpass helper failed"
 [[ "$got" == "fixture pin" ]] || fail "askpass decode"
 [[ "$(cat "$desc")" == *"SETDESC Password required for netshare:"* ]] || fail "askpass prompt"
 [[ "$(cat "$desc")" == *GETPIN* ]] || fail "askpass getpin"
@@ -105,7 +109,7 @@ exit 1
 EOF
 chmod 755 "$cancel"
 set +e
-cancelled=$(NETSHARE_PINENTRY=$cancel "$ASKPASS_HELPER" "Password required for netshare:" 2>"$tmp/cancel.err")
+cancelled=$(NETSHARE_PINENTRY=$cancel "$ROOT/lib/askpass.sh" "Password required for netshare:" 2>"$tmp/cancel.err")
 rc=$?
 set -e
 [[ "$rc" -ne 0 ]] || fail "cancel exited 0"

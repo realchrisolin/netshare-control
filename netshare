@@ -4,6 +4,12 @@
 # panel readout and does not change routes.
 
 set -euo pipefail
+# Root must not resolve helpers out of a user-writable checkout. sudo's
+# secure_path can point at one. The unprivileged half keeps the caller's PATH
+# so it can still find sudo and a terminal.
+if [[ "$(id -u)" -eq 0 ]]; then
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+fi
 HERE=$(dirname "$(readlink -f "$0")")
 # shellcheck source=lib/tunnel.sh
 source "$HERE/lib/tunnel.sh"
